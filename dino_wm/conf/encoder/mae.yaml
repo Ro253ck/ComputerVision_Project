@@ -1,0 +1,2 @@
+_target_: models.hf_encoders.MAEEncoder
+name: "facebook/vit-mae-base"

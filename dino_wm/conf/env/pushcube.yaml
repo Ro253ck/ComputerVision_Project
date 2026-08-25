@@ -1,0 +1,15 @@
+name: pushcube
+args: []
+kwargs: {}
+
+dataset:
+  _target_: "datasets.pushcube_dset.load_pushcube_slice_train_val"
+  n_rollout: 10000
+  normalize_action: ${normalize_action}
+  data_path: ${oc.env:DATASET_DIR}/pushcube_noise
+  transform:
+    _target_: "datasets.img_transforms.default_transform"
+    img_size: ${img_size}
+
+decoder_path: null
+num_workers: 8

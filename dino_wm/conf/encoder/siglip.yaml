@@ -1,0 +1,2 @@
+_target_: models.hf_encoders.SigLIPEncoder
+name: "google/siglip-base-patch16-224"

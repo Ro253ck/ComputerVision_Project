@@ -1,0 +1,2 @@
+_target_: models.hf_encoders.CLIPEncoder
+name: "openai/clip-vit-base-patch16"

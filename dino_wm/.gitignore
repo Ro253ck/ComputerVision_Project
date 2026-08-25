@@ -2,3 +2,8 @@ __pycache__
 *.pyc
 outputs
 plan_outputs
+data
+wandb
+*.pth
+datasets/pusht_dset_copia.py
+datasets/pusht_dset_copia2.py
