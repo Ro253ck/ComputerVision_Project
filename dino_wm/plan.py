@@ -267,11 +267,15 @@ class PlanWorkspace:
         env_info = []
 
         # Check if any trajectory is long enough
-        valid_traj = [
-            self.dset[i][0]["visual"].shape[0]
-            for i in range(len(self.dset))
-            if self.dset[i][0]["visual"].shape[0] >= traj_len
-        ]
+        #valid_traj = [
+        #    self.dset[i][0]["visual"].shape[0]
+        #    for i in range(len(self.dset))
+        #    if self.dset[i][0]["visual"].shape[0] >= traj_len
+        #]
+        #if len(valid_traj) == 0:
+        # Check if any trajectory is long enough
+        seq_lengths = [self.dset.get_seq_length(i) for i in range(len(self.dset))]
+        valid_traj = [l for l in seq_lengths if l >= traj_len]
         if len(valid_traj) == 0:
             raise ValueError("No trajectory in the dataset is long enough.")
 
@@ -350,58 +354,140 @@ class PlanWorkspace:
         return logs
 
 
+# def load_ckpt(snapshot_path, device):
+#     with snapshot_path.open("rb") as f:
+#         payload = torch.load(f, map_location=device)
+#     loaded_keys = []
+#     result = {}
+#     for k, v in payload.items():
+#         if k in ALL_MODEL_KEYS:
+#             loaded_keys.append(k)
+#             result[k] = v.to(device)
+#     result["epoch"] = payload["epoch"]
+#     return result
+
+
+# def load_model(model_ckpt, train_cfg, num_action_repeat, device):
+#     result = {}
+#     if model_ckpt.exists():
+#         result = load_ckpt(model_ckpt, device)
+#         print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
+
+#     if "encoder" not in result:
+#         result["encoder"] = hydra.utils.instantiate(
+#             train_cfg.encoder,
+#         )
+#     if "predictor" not in result:
+#         raise ValueError("Predictor not found in model checkpoint")
+
+#     if train_cfg.has_decoder and "decoder" not in result:
+#         base_path = os.path.dirname(os.path.abspath(__file__))
+#         if train_cfg.env.decoder_path is not None:
+#             decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
+#             ckpt = torch.load(decoder_path)
+#             if isinstance(ckpt, dict):
+#                 result["decoder"] = ckpt["decoder"]
+#             else:
+#                 result["decoder"] = torch.load(decoder_path)
+#         else:
+#             raise ValueError(
+#                 "Decoder path not found in model checkpoint \
+#                                 and is not provided in config"
+#             )
+#     elif not train_cfg.has_decoder:
+#         result["decoder"] = None
+
+#     model = hydra.utils.instantiate(
+#         train_cfg.model,
+#         encoder=result["encoder"],
+#         proprio_encoder=result["proprio_encoder"],
+#         action_encoder=result["action_encoder"],
+#         predictor=result["predictor"],
+#         decoder=result["decoder"],
+#         proprio_dim=train_cfg.proprio_emb_dim,
+#         action_dim=train_cfg.action_emb_dim,
+#         concat_dim=train_cfg.concat_dim,
+#         num_action_repeat=num_action_repeat,
+#         num_proprio_repeat=train_cfg.num_proprio_repeat,
+#     )
+#     model.to(device)
+#     return model
+
 def load_ckpt(snapshot_path, device):
     with snapshot_path.open("rb") as f:
-        payload = torch.load(f, map_location=device)
-    loaded_keys = []
-    result = {}
-    for k, v in payload.items():
-        if k in ALL_MODEL_KEYS:
-            loaded_keys.append(k)
-            result[k] = v.to(device)
-    result["epoch"] = payload["epoch"]
-    return result
+        return torch.load(f, map_location=device)   # dict di state_dict (+ 'epoch')
 
 
-def load_model(model_ckpt, train_cfg, num_action_repeat, device):
-    result = {}
-    if model_ckpt.exists():
-        result = load_ckpt(model_ckpt, device)
-        print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
+def load_model(model_ckpt, train_cfg, num_action_repeat, device, dset):
+    payload = torch.load(model_ckpt, map_location=device)
+    print(f"Loaded checkpoint from epoch {payload['epoch']}: {model_ckpt}")
 
-    if "encoder" not in result:
-        result["encoder"] = hydra.utils.instantiate(
-            train_cfg.encoder,
-        )
-    if "predictor" not in result:
-        raise ValueError("Predictor not found in model checkpoint")
+    # encoder
+    encoder = hydra.utils.instantiate(train_cfg.encoder)
+    if "encoder" in payload:
+        encoder.load_state_dict(payload["encoder"])
 
-    if train_cfg.has_decoder and "decoder" not in result:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        if train_cfg.env.decoder_path is not None:
-            decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-            ckpt = torch.load(decoder_path)
-            if isinstance(ckpt, dict):
-                result["decoder"] = ckpt["decoder"]
-            else:
-                result["decoder"] = torch.load(decoder_path)
-        else:
-            raise ValueError(
-                "Decoder path not found in model checkpoint \
-                                and is not provided in config"
-            )
-    elif not train_cfg.has_decoder:
-        result["decoder"] = None
+    # proprio encoder: in_chans letto dal checkpoint stesso (non dal dataset)
+    proprio_in_chans = payload["proprio_encoder"]["patch_embed.weight"].shape[1]
+    proprio_encoder = hydra.utils.instantiate(
+        train_cfg.proprio_encoder,
+        in_chans=proprio_in_chans,
+        emb_dim=train_cfg.proprio_emb_dim,
+    )
+    proprio_encoder.load_state_dict(payload["proprio_encoder"])
+    proprio_emb_dim = proprio_encoder.emb_dim
+
+    # action encoder: in_chans letto dal checkpoint stesso
+    action_in_chans = payload["action_encoder"]["patch_embed.weight"].shape[1]
+    action_encoder = hydra.utils.instantiate(
+        train_cfg.action_encoder,
+        in_chans=action_in_chans,
+        emb_dim=train_cfg.action_emb_dim,
+    )
+    action_encoder.load_state_dict(payload["action_encoder"])
+    action_emb_dim = action_encoder.emb_dim
+
+    # predictor (stessa logica di num_patches/dim di train.py:init_models)
+    if encoder.latent_ndim == 1:
+        num_patches = 1
+    else:
+        num_side_patches = train_cfg.img_size // 16
+        num_patches = num_side_patches ** 2
+    if train_cfg.concat_dim == 0:
+        num_patches += 2
+
+    predictor = hydra.utils.instantiate(
+        train_cfg.predictor,
+        num_patches=num_patches,
+        num_frames=train_cfg.num_hist,
+        dim=encoder.emb_dim + (
+            proprio_emb_dim * train_cfg.num_proprio_repeat
+            + action_emb_dim * train_cfg.num_action_repeat
+        ) * train_cfg.concat_dim,
+    )
+    if "predictor" not in payload:
+        raise ValueError("Predictor non trovato nel checkpoint")
+    predictor.load_state_dict(payload["predictor"])
+
+    # decoder (None se il checkpoint non ne ha uno - setup normale, solo
+    # predictor allenato; presente solo per i run "solo decoder" fatti apposta
+    # per la visualizzazione real-vs-ricostruita in planning/evaluator.py)
+    decoder = None
+    if train_cfg.has_decoder:
+        decoder = hydra.utils.instantiate(train_cfg.decoder, emb_dim=encoder.emb_dim)
+        if "decoder" not in payload:
+            raise ValueError("has_decoder=True ma 'decoder' non trovato nel checkpoint")
+        decoder.load_state_dict(payload["decoder"])
 
     model = hydra.utils.instantiate(
         train_cfg.model,
-        encoder=result["encoder"],
-        proprio_encoder=result["proprio_encoder"],
-        action_encoder=result["action_encoder"],
-        predictor=result["predictor"],
-        decoder=result["decoder"],
-        proprio_dim=train_cfg.proprio_emb_dim,
-        action_dim=train_cfg.action_emb_dim,
+        encoder=encoder,
+        proprio_encoder=proprio_encoder,
+        action_encoder=action_encoder,
+        predictor=predictor,
+        decoder=decoder,
+        proprio_dim=proprio_emb_dim,
+        action_dim=action_emb_dim,
         concat_dim=train_cfg.concat_dim,
         num_action_repeat=num_action_repeat,
         num_proprio_repeat=train_cfg.num_proprio_repeat,
@@ -456,7 +542,8 @@ def planning_main(cfg_dict):
     model_ckpt = (
         Path(model_path) / "checkpoints" / f"model_{cfg_dict['model_epoch']}.pth"
     )
-    model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
+    #model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
+    model = load_model(model_ckpt, model_cfg, num_action_repeat, device, dset)
 
     # use dummy vector env for wall and deformable envs
     if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
@@ -464,12 +551,49 @@ def planning_main(cfg_dict):
         env = SerialVectorEnv(
             [
                 gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+                    model_cfg.env.name,
+                    *model_cfg.env.args,
+                    disable_env_checker=True,  # DotWall never sets action_space, which trips gym's PassiveEnvChecker
+                    **model_cfg.env.kwargs,
                 )
                 for _ in range(cfg_dict["n_evals"])
             ]
         )
+
+    # use dummy vector env for wall and deformable envs
+    #if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
+    #    from env.serial_vector_env import SerialVectorEnv
+    #    env = SerialVectorEnv(
+    #        [
+    #            gym.make(
+    #                model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+    #            )
+    #            for _ in range(cfg_dict["n_evals"])
+    #        ]
+    #    )
     else:
+        # DINO_WM_FORCE_FORK=1 e' una via di fuga SOLO per test diagnostici
+        # (verificare se "fork" funziona per pushcube su una GPU dedicata,
+        # invece di quella condivisa usata nei primi test) - normalmente non
+        # va impostata, il default (spawn per pushcube) resta quello giusto.
+        force_fork_test = os.environ.get("DINO_WM_FORCE_FORK") == "1"
+        if model_cfg.env.name == "pushcube" and not force_fork_test:
+            # SubprocVectorEnv usa "fork" di default (Linux). Il processo
+            # principale carica pero' il modello su GPU prima di creare i
+            # sottoprocessi: un figlio "fork" eredita quel contesto CUDA gia'
+            # inizializzato, causa nota di blocchi silenziosi con librerie
+            # che usano la GPU nei figli (il rendering di ManiSkill/SAPIEN).
+            # "spawn" crea processi puliti ed e' il metodo raccomandato da
+            # PyTorch per multiprocessing+CUDA - ma ha un costo: ogni figlio
+            # si crea un proprio contesto CUDA (~700MB l'uno), quindi lo
+            # forziamo SOLO per pushcube. PushT/Wall restano su "fork"
+            # (default): i loro simulatori sono puro CPU, i figli non
+            # toccano mai CUDA, quindi "fork" e' sia sicuro che senza
+            # l'overhead di memoria di "spawn" (verificato: con "spawn"
+            # globale, 50 sottoprocessi PushT hanno esaurito 45GB di GPU
+            # solo di overhead, senza fare nulla).
+            import multiprocessing
+            multiprocessing.set_start_method("spawn", force=True)
         env = SubprocVectorEnv(
             [
                 lambda: gym.make(

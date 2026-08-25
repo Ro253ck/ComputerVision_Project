@@ -129,6 +129,9 @@ class Trainer:
                 shuffle=False, # already shuffled in TrajSlicerDataset
                 num_workers=self.cfg.env.num_workers,
                 collate_fn=None,
+                pin_memory=True,  # aggiungere questa riga
+                persistent_workers=True,     # <-- NUOVO
+                prefetch_factor=4,            # <-- NUOVO, opzionale, aiuta a nascondere la latenza
             )
             for x in ["train", "valid"]
         }
@@ -171,7 +174,58 @@ class Trainer:
         self.init_models()
         self.init_optimizers()
 
+        #Andiamo a rieseumare il modello qua, visto che è gia inizializzato
+        model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
+        if model_ckpt.exists():
+            self.load_ckpt(model_ckpt)
+            log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
+        
         self.epoch_log = OrderedDict()
+
+    # def save_ckpt(self):
+    #     self.accelerator.wait_for_everyone()
+    #     if self.accelerator.is_main_process:
+    #         if not os.path.exists("checkpoints"):
+    #             os.makedirs("checkpoints")
+    #         ckpt = {}
+    #         for k in self._keys_to_save:
+    #             if hasattr(self.__dict__[k], "module"):
+    #                 ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
+    #             else:
+    #                 ckpt[k] = self.__dict__[k]
+    #         torch.save(ckpt, "checkpoints/model_latest.pth")
+    #         torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
+    #         log.info("Saved model to {}".format(os.getcwd()))
+    #         ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
+    #     else:
+    #         ckpt_path = None
+    #     model_name = self.cfg["saved_folder"].split("outputs/")[-1]
+    #     model_epoch = self.epoch
+    #     return ckpt_path, model_name, model_epoch
+
+    # def save_ckpt(self):
+    #     self.accelerator.wait_for_everyone()
+    #     if self.accelerator.is_main_process:
+    #         if not os.path.exists("checkpoints"):
+    #             os.makedirs("checkpoints")
+    #         ckpt = {}
+    #         for k in self._keys_to_save:
+    #             obj = self.__dict__[k]
+    #             if hasattr(obj, "module"):
+    #                 ckpt[k] = self.accelerator.unwrap_model(obj)
+    #             elif hasattr(obj, "state_dict"):
+    #                 ckpt[k] = obj.state_dict()
+    #             else:
+    #                 ckpt[k] = obj
+    #         torch.save(ckpt, "checkpoints/model_latest.pth")
+    #         torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
+    #         log.info("Saved model to {}".format(os.getcwd()))
+    #         ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
+    #     else:
+    #         ckpt_path = None
+    #     model_name = self.cfg["saved_folder"].split("outputs/")[-1]
+    #     model_epoch = self.epoch
+    #     return ckpt_path, model_name, model_epoch
 
     def save_ckpt(self):
         self.accelerator.wait_for_everyone()
@@ -180,10 +234,15 @@ class Trainer:
                 os.makedirs("checkpoints")
             ckpt = {}
             for k in self._keys_to_save:
-                if hasattr(self.__dict__[k], "module"):
-                    ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
+                obj = self.__dict__[k]
+                # spacchetta la DDP, se presente
+                if hasattr(obj, "module"):
+                    obj = self.accelerator.unwrap_model(obj)
+                # salva sempre lo state_dict per moduli e ottimizzatori
+                if hasattr(obj, "state_dict"):
+                    ckpt[k] = obj.state_dict()
                 else:
-                    ckpt[k] = self.__dict__[k]
+                    ckpt[k] = obj   # valori semplici (es. epoch)
             torch.save(ckpt, "checkpoints/model_latest.pth")
             torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
             log.info("Saved model to {}".format(os.getcwd()))
@@ -194,19 +253,50 @@ class Trainer:
         model_epoch = self.epoch
         return ckpt_path, model_name, model_epoch
 
+    # def load_ckpt(self, filename="model_latest.pth"):
+    #     ckpt = torch.load(filename)
+    #     for k, v in ckpt.items():
+    #         self.__dict__[k] = v
+    #     not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
+    #     if len(not_in_ckpt):
+    #         log.warning("Keys not found in ckpt: %s", not_in_ckpt)
+
+    # def load_ckpt(self, filename="model_latest.pth"):
+    #     ckpt = torch.load(filename)
+    #     for k, v in ckpt.items():
+    #         if k not in self.__dict__:
+    #             log.warning(f"Key {k} not in trainer, skipping")
+    #             continue
+    #         if hasattr(self.__dict__[k], "load_state_dict") and isinstance(v, dict):
+    #             self.__dict__[k].load_state_dict(v)
+    #         else:
+    #             self.__dict__[k] = v
+    #     not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
+    #     if len(not_in_ckpt):
+    #         log.warning("Keys not found in ckpt: %s", not_in_ckpt)
+
     def load_ckpt(self, filename="model_latest.pth"):
-        ckpt = torch.load(filename)
+        ckpt = torch.load(filename, map_location=self.device)
         for k, v in ckpt.items():
-            self.__dict__[k] = v
+            if k not in self.__dict__:
+                log.warning(f"Key {k} not in trainer, skipping")
+                continue
+            obj = self.__dict__[k]
+            # carica dentro il modulo sottostante alla DDP, in-place
+            target = self.accelerator.unwrap_model(obj) if hasattr(obj, "module") else obj
+            if isinstance(v, dict) and hasattr(target, "load_state_dict"):
+                target.load_state_dict(v)
+            else:
+                self.__dict__[k] = v   # valori semplici (es. epoch)
         not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
         if len(not_in_ckpt):
             log.warning("Keys not found in ckpt: %s", not_in_ckpt)
-
+            
     def init_models(self):
-        model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
-        if model_ckpt.exists():
-            self.load_ckpt(model_ckpt)
-            log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
+        # model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
+        # if model_ckpt.exists():
+        #     self.load_ckpt(model_ckpt)
+        #     log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
 
         # initialize encoder
         if self.encoder is None:
@@ -374,6 +464,7 @@ class Trainer:
             self.accelerator.wait_for_everyone()
             self.train()
             self.accelerator.wait_for_everyone()
+            torch.cuda.empty_cache()  # <-- FIX: libera cache tra train e val
             self.val()
             self.logs_flash(step=self.epoch)
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
@@ -443,6 +534,10 @@ class Trainer:
         for i, data in enumerate(
             tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
+            # ACCORCIAMO L'EPOCA: interrompiamo dopo 500 batch per salvare il checkpoint
+            # if i >= 20:
+            #     break
+            
             obs, act, state = data
             plot = i == 0  # only plot from the first batch
             self.model.train()
@@ -558,9 +653,10 @@ class Trainer:
             obs, act, state = data
             plot = i == 0
             self.model.eval()
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                obs, act
-            )
+            with torch.no_grad():  # <-- FIX: evita allocazione gradienti
+                z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
+                    obs, act
+                )
 
             loss = self.accelerator.gather_for_metrics(loss).mean()
 
@@ -571,21 +667,22 @@ class Trainer:
 
             if self.cfg.has_decoder and plot:
                 # only eval images when plotting due to speed
-                if self.cfg.has_predictor:
-                    z_obs_out, z_act_out = self.model.separate_emb(z_out)
-                    z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
+                with torch.no_grad():  # <-- FIX: anche qui
+                    if self.cfg.has_predictor:
+                        z_obs_out, z_act_out = self.model.separate_emb(z_out)
+                        z_gt = self.model.encode_obs(obs)
+                        z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
 
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
-                    err_logs = self.err_eval(z_obs_out, z_tgt)
+                        state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
+                        err_logs = self.err_eval(z_obs_out, z_tgt)
 
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
-                    err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
-                    }
-                    err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
+                        err_logs = self.accelerator.gather_for_metrics(err_logs)
+                        err_logs = {
+                            key: value.mean().item() for key, value in err_logs.items()
+                        }
+                        err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
 
-                    self.logs_update(err_logs)
+                        self.logs_update(err_logs)
 
                 if visual_out is not None:
                     for t in range(
@@ -629,6 +726,96 @@ class Trainer:
             loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
 
+    # def openloop_rollout(
+    #     self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
+    # ):
+    #     np.random.seed(self.cfg.training.seed)
+    #     min_horizon = min_horizon + self.cfg.num_hist
+    #     plotting_dir = f"rollout_plots/e{self.epoch}_rollout"
+    #     if self.accelerator.is_main_process:
+    #         os.makedirs(plotting_dir, exist_ok=True)
+    #     self.accelerator.wait_for_everyone()
+    #     logs = {}
+
+    #     # rollout with both num_hist and 1 frame as context
+    #     num_past = [(self.cfg.num_hist, ""), (1, "_1framestart")]
+
+    #     # sample traj
+    #     for idx in range(num_rollout):
+    #         valid_traj = False
+    #         while not valid_traj:
+    #             traj_idx = np.random.randint(0, len(dset))
+    #             obs, act, state, _ = dset[traj_idx]
+    #             act = act.to(self.device)
+    #             if rand_start_end:
+    #                 if obs["visual"].shape[0] > min_horizon * self.cfg.frameskip + 1:
+    #                     start = np.random.randint(
+    #                         0,
+    #                         obs["visual"].shape[0] - min_horizon * self.cfg.frameskip - 1,
+    #                     )
+    #                 else:
+    #                     start = 0
+    #                 max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
+    #                 if max_horizon > min_horizon:
+    #                     valid_traj = True
+    #                     horizon = np.random.randint(min_horizon, max_horizon + 1)
+    #             else:
+    #                 valid_traj = True
+    #                 start = 0
+    #                 horizon = (obs["visual"].shape[0] - 1) // self.cfg.frameskip
+
+    #         for k in obs.keys():
+    #             obs[k] = obs[k][
+    #                 start : 
+    #                 start + horizon * self.cfg.frameskip + 1 : 
+    #                 self.cfg.frameskip
+    #             ]
+    #         act = act[start : start + horizon * self.cfg.frameskip]
+    #         act = rearrange(act, "(h f) d -> h (f d)", f=self.cfg.frameskip)
+
+    #         obs_g = {}
+    #         for k in obs.keys():
+    #             obs_g[k] = obs[k][-1].unsqueeze(0).unsqueeze(0).to(self.device)
+    #         z_g = self.model.encode_obs(obs_g)
+    #         actions = act.unsqueeze(0)
+
+    #         for past in num_past:
+    #             n_past, postfix = past
+
+    #             obs_0 = {}
+    #             for k in obs.keys():
+    #                 obs_0[k] = (
+    #                     obs[k][:n_past].unsqueeze(0).to(self.device)
+    #                 )  # unsqueeze for batch, (b, t, c, h, w)
+
+    #             z_obses, z = self.model.rollout(obs_0, actions)
+    #             z_obs_last = slice_trajdict_with_t(z_obses, start_idx=-1, end_idx=None)
+    #             div_loss = self.err_eval_single(z_obs_last, z_g)
+
+    #             for k in div_loss.keys():
+    #                 log_key = f"z_{k}_err_rollout{postfix}"
+    #                 if log_key in logs:
+    #                     logs[f"z_{k}_err_rollout{postfix}"].append(
+    #                         div_loss[k]
+    #                     )
+    #                 else:
+    #                     logs[f"z_{k}_err_rollout{postfix}"] = [
+    #                         div_loss[k]
+    #                     ]
+
+    #             if self.cfg.has_decoder:
+    #                 visuals = self.model.decode_obs(z_obses)[0]["visual"]
+    #                 imgs = torch.cat([obs["visual"], visuals[0].cpu()], dim=0)
+    #                 self.plot_imgs(
+    #                     imgs,
+    #                     obs["visual"].shape[0],
+    #                     f"{plotting_dir}/e{self.epoch}_{mode}_{idx}{postfix}.png",
+    #                 )
+    #     logs = {
+    #         key: sum(values) / len(values) for key, values in logs.items() if values
+    #     }
+    #     return logs
+
     def openloop_rollout(
         self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
     ):
@@ -650,22 +837,24 @@ class Trainer:
                 traj_idx = np.random.randint(0, len(dset))
                 obs, act, state, _ = dset[traj_idx]
                 act = act.to(self.device)
+                vkey = "visual" if "visual" in obs else "visual_emb"  # <-- cache-aware
+                T = obs[vkey].shape[0]                                # <-- num. frame
                 if rand_start_end:
-                    if obs["visual"].shape[0] > min_horizon * self.cfg.frameskip + 1:
+                    if T > min_horizon * self.cfg.frameskip + 1:
                         start = np.random.randint(
                             0,
-                            obs["visual"].shape[0] - min_horizon * self.cfg.frameskip - 1,
+                            T - min_horizon * self.cfg.frameskip - 1,
                         )
                     else:
                         start = 0
-                    max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
+                    max_horizon = (T - start - 1) // self.cfg.frameskip
                     if max_horizon > min_horizon:
                         valid_traj = True
                         horizon = np.random.randint(min_horizon, max_horizon + 1)
                 else:
                     valid_traj = True
                     start = 0
-                    horizon = (obs["visual"].shape[0] - 1) // self.cfg.frameskip
+                    horizon = (T - 1) // self.cfg.frameskip
 
             for k in obs.keys():
                 obs[k] = obs[k][

@@ -28,8 +28,17 @@ class PushTDataset(TrajDataset):
         relative=True,
         action_scale=100.0,
         with_velocity: bool = True, # agent's velocity
+        use_dino_cache: bool = False, #Riga aggiunta per gestire il salvataggio delle feature
     ):  
         self.data_path = Path(data_path)
+        self.dino_cache_dir = self.data_path / "dino_feats" #Riga aggiunta per gestire il salvataggio delle feature
+        self.use_dino_cache = use_dino_cache   #Riga aggiunta per gestire il salvataggio delle feature
+
+        self._mmap_cache = {}       # NUOVO
+        self._video_reader_cache = {}  # NUOVO (usato anche nel Caso B)
+        self._FEAT_N = 196          # NUOVO: numero patch del tuo encoder
+        self._FEAT_D = 384          # NUOVO: dim embedding del tuo encoder
+
         self.transform = transform
         self.relative = relative
         self.normalize_action = normalize_action
@@ -105,13 +114,33 @@ class PushTDataset(TrajDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
+    #Nuova 
+    def _get_feat_mmap(self, idx):
+        if idx not in self._mmap_cache:
+            T = self.seq_lengths[idx]
+            path = self.dino_cache_dir / f"episode_{idx:03d}.dat"
+            self._mmap_cache[idx] = np.memmap(
+                path, dtype=np.float16, mode="r", shape=(T, self._FEAT_N, self._FEAT_D)
+            )
+        return self._mmap_cache[idx]
+
     def get_frames(self, idx, frames):
-        vid_dir = self.data_path / "obses"
-        reader = VideoReader(str(vid_dir / f"episode_{idx:03d}.mp4"), num_threads=1)
+       
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
         proprio = self.proprios[idx, frames]
         shape = self.shapes[idx]
+
+        #Inizio parte aggiunta
+        if self.use_dino_cache:
+            feat_mmap = self._get_feat_mmap(idx)
+            feats = torch.from_numpy(np.array(feat_mmap[list(frames)])).float()
+            obs = {"visual_emb": feats, "proprio": proprio}
+            return obs, act, state, {'shape': shape}
+        #fine parte aggiunta
+
+        vid_dir = self.data_path / "obses"
+        reader = VideoReader(str(vid_dir / f"episode_{idx:03d}.mp4"), num_threads=1)
 
         image = reader.get_batch(frames)  # THWC
         image = image / 255.0
@@ -144,6 +173,7 @@ def load_pusht_slice_train_val(
     num_pred=0,
     frameskip=0,
     with_velocity=True,
+    use_dino_cache=False, #Riga aggiunta per gestire le dine feature
 ):
     train_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -151,6 +181,7 @@ def load_pusht_slice_train_val(
         data_path=data_path + "/train",
         normalize_action=normalize_action,
         with_velocity=with_velocity,
+        use_dino_cache=use_dino_cache,   # <-- aggiungi
     )
     val_dset = PushTDataset(
         n_rollout=n_rollout,
@@ -158,6 +189,7 @@ def load_pusht_slice_train_val(
         data_path=data_path + "/val",
         normalize_action=normalize_action,
         with_velocity=with_velocity,
+        use_dino_cache=use_dino_cache,   # <-- aggiungi
     )
 
     num_frames = num_hist + num_pred

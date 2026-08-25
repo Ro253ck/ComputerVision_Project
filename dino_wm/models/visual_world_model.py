@@ -12,7 +12,7 @@ class VWorldModel(nn.Module):
         encoder,
         proprio_encoder,
         action_encoder,
-        decoder,
+        decoder, 
         predictor,
         proprio_dim=0,
         action_dim=0,
@@ -122,12 +122,15 @@ class VWorldModel(nn.Module):
         input : obs (dict): "visual", "proprio" (b, t, 3, img_size, img_size)
         output:   z (dict): "visual", "proprio" (b, t, num_patches, encoder_emb_dim)
         """
-        visual = obs['visual']
-        b = visual.shape[0]
-        visual = rearrange(visual, "b t ... -> (b t) ...")
-        visual = self.encoder_transform(visual)
-        visual_embs = self.encoder.forward(visual)
-        visual_embs = rearrange(visual_embs, "(b t) p d -> b t p d", b=b)
+        if "visual_emb" in obs:
+            visual_embs=obs["visual_emb"]
+        else:
+            visual = obs['visual']
+            b = visual.shape[0]
+            visual = rearrange(visual, "b t ... -> (b t) ...")
+            visual = self.encoder_transform(visual)
+            visual_embs = self.encoder.forward(visual)
+            visual_embs = rearrange(visual_embs, "(b t) p d -> b t p d", b=b)
 
         proprio = obs['proprio']
         proprio_emb = self.encode_proprio(proprio)
@@ -199,8 +202,9 @@ class VWorldModel(nn.Module):
         z = self.encode(obs, act)
         z_src = z[:, : self.num_hist, :, :]  # (b, num_hist, num_patches, dim)
         z_tgt = z[:, self.num_pred :, :, :]  # (b, num_hist, num_patches, dim)
-        visual_src = obs['visual'][:, : self.num_hist, ...]  # (b, num_hist, 3, img_size, img_size)
-        visual_tgt = obs['visual'][:, self.num_pred :, ...]  # (b, num_hist, 3, img_size, img_size)
+        if 'visual' in obs:
+            visual_src = obs['visual'][:, : self.num_hist, ...]
+            visual_tgt = obs['visual'][:, self.num_pred :, ...]
 
         if self.predictor is not None:
             z_pred = self.predict(z_src)
@@ -289,7 +293,8 @@ class VWorldModel(nn.Module):
                 visuals: (b, t+n+1, 3, img_size, img_size)
                 z: (b, t+n+1, num_patches, emb_dim)
         """
-        num_obs_init = obs_0['visual'].shape[1]
+        vkey = "visual" if "visual" in obs_0 else "visual_emb"  # aggiunta
+        num_obs_init = obs_0[vkey].shape[1]
         act_0 = act[:, :num_obs_init]
         action = act[:, num_obs_init:] 
         z = self.encode(obs_0, act_0)
