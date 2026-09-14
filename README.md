@@ -1,3 +1,13 @@
+# Visual Backbone Comparison for Robotic Manipulation World Models
+
+Reproduction and extension of [DINO-WM](https://github.com/gaoyuezhou/dino_wm) (Zhou et al., 2024),
+comparing pre-trained visual backbones (DINOv2, CLIP, SigLIP, MAE) as encoders for a world model
+applied to robotic manipulation tasks.
+
+## Authors
+- Rocco Lubino
+- Giulia Moretti
+
 ## Acknowledgements
 
 This project uses [DINO-WM](https://github.com/gaoyuezhou/dino_wm)
