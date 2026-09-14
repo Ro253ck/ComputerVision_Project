@@ -1,9 +1,31 @@
-__pycache__
-*.pyc
-outputs
-plan_outputs
-data
-wandb
+data/
+outputs/
+plan_outputs/
+wandb/
+__pycache__/
 *.pth
+*.mp4
+*.pyc
+
+# scripts/ only ships the canonical generation script; the rest are
+# one-off analysis/debug tools kept locally but not tracked
+scripts/aggregate_plan_results.py
+scripts/compute_pushcube_stats.py
+scripts/convert_cache_to_memmap.py
+scripts/filter_pushcube_goodgoal.py
+scripts/generate_pushcube_dataset.sbatch
+scripts/generate_pushcube_val_goodgoal.py
+scripts/generate_pushcube_val_highretry.py
+scripts/precompute_dino_features.py
+scripts/recompute_success_goodgoal_subset.py
+scripts/recover_pushcube_seeds.py
+scripts/retry_pushcube_close_misses.py
+scripts/train_pushcube_clip_5000.sh
+scripts/train_pushcube_dino_5000.sh
+scripts/trim_pushcube_seq_lengths.py
+
+# stray local artifacts, kept on disk but not tracked
 datasets/pusht_dset_copia.py
 datasets/pusht_dset_copia2.py
+planning/evaluator.py.bak_20260901_102325
+results_raw.csv

@@ -120,15 +120,6 @@ class CEMPlanner(BasePlanner):
             self.wandb_run.log(
                 {f"{self.logging_prefix}/loss": np.mean(losses), "step": i + 1}
             )
-            # scritta anche su file dedicato, indipendente da wandb: quando
-            # wandb e' disabilitato/offline (come nel planning) questo valore
-            # non finisce da nessuna parte altrimenti, dato che dump_logs()
-            # qui sotto non viene chiamato per la loss di CEM (solo per i log
-            # di eval_actions) - puramente diagnostico, non cambia il
-            # comportamento del planning
-            with open("cem_loss_debug.json", "a") as f:
-                f.write(f'{{"logging_prefix": "{self.logging_prefix}", '
-                        f'"opt_step": {i + 1}, "loss": {np.mean(losses)}}}\n')
             if self.evaluator is not None and i % self.eval_every == 0:
                 logs, successes, _, _ = self.evaluator.eval_actions(
                     mu, filename=f"{self.logging_prefix}_output_{i+1}"

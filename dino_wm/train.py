@@ -129,9 +129,9 @@ class Trainer:
                 shuffle=False, # already shuffled in TrajSlicerDataset
                 num_workers=self.cfg.env.num_workers,
                 collate_fn=None,
-                pin_memory=True,  # aggiungere questa riga
-                persistent_workers=True,     # <-- NUOVO
-                prefetch_factor=4,            # <-- NUOVO, opzionale, aiuta a nascondere la latenza
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=4,  # optional, helps hide data-loading latency
             )
             for x in ["train", "valid"]
         }
@@ -235,14 +235,12 @@ class Trainer:
             ckpt = {}
             for k in self._keys_to_save:
                 obj = self.__dict__[k]
-                # spacchetta la DDP, se presente
-                if hasattr(obj, "module"):
+                if hasattr(obj, "module"):  # unwrap DDP, if present
                     obj = self.accelerator.unwrap_model(obj)
-                # salva sempre lo state_dict per moduli e ottimizzatori
-                if hasattr(obj, "state_dict"):
+                if hasattr(obj, "state_dict"):  # modules and optimizers always save via state_dict
                     ckpt[k] = obj.state_dict()
                 else:
-                    ckpt[k] = obj   # valori semplici (es. epoch)
+                    ckpt[k] = obj  # plain values (e.g. epoch)
             torch.save(ckpt, "checkpoints/model_latest.pth")
             torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
             log.info("Saved model to {}".format(os.getcwd()))
@@ -282,12 +280,11 @@ class Trainer:
                 log.warning(f"Key {k} not in trainer, skipping")
                 continue
             obj = self.__dict__[k]
-            # carica dentro il modulo sottostante alla DDP, in-place
-            target = self.accelerator.unwrap_model(obj) if hasattr(obj, "module") else obj
+            target = self.accelerator.unwrap_model(obj) if hasattr(obj, "module") else obj  # load into the module underlying DDP, in-place
             if isinstance(v, dict) and hasattr(target, "load_state_dict"):
                 target.load_state_dict(v)
             else:
-                self.__dict__[k] = v   # valori semplici (es. epoch)
+                self.__dict__[k] = v  # plain values (e.g. epoch)
         not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
         if len(not_in_ckpt):
             log.warning("Keys not found in ckpt: %s", not_in_ckpt)

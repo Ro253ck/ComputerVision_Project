@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch
 
 class DummyModel(nn.Module):
-    def __init__(self, emb_dim, **kwargs): # **kwargs ->  accetta e ignora qualsiasi parametro extra, così puoi swapparlo con altri encoder che hanno più parametri senza cambiare il codice che lo istanzia
+    def __init__(self, emb_dim, **kwargs):
         super().__init__()
         self.name = "dummy"
         self.latent_ndim = 1

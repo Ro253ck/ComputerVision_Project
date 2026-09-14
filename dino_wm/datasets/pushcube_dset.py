@@ -9,10 +9,7 @@ from typing import Callable, Optional
 from .traj_dset import TrajDataset, TrajSlicerDataset
 decord.bridge.set_bridge("torch")
 
-# statistiche precalcolate su data/pushcube_noise/train (10000 rollout,
-# seq_lengths corretti con scripts/trim_pushcube_seq_lengths.py - lunghezza
-# variabile fino a poco dopo il successo, non piu' 150 fissi), vedi
-# scripts/compute_pushcube_stats.py
+# precomputed stats over data/pushcube_noise/train (10000 rollouts), see scripts/compute_pushcube_stats.py
 ACTION_MEAN = torch.tensor([0.0152, 0.0005, -0.0513, -0.9799])
 ACTION_STD = torch.tensor([0.0870, 0.0540, 0.0872, 0.0298])
 PROPRIO_MEAN = torch.tensor([0.0231, -0.0003, 0.0543, 0.0008, -0.0000, -0.0016])
@@ -38,13 +35,7 @@ class PushCubeDataset(TrajDataset):
         with open(self.data_path / "seq_lengths.pkl", "rb") as f:
             self.seq_lengths = pickle.load(f)
 
-        # seed ManiSkill di ogni episodio (scripts/recover_pushcube_seeds.py):
-        # serve solo per il planning (PushCubeEnvWrapper.rollout/prepare), che
-        # deve poter tornare alla scena fisica esatta di un episodio - lo
-        # stato compatto (9 valori) non basta a ricostruirla per ManiSkill,
-        # a differenza di PushT/Wall. Opzionale: se il file non esiste
-        # (dataset generato prima di questa modifica, o serve solo per il
-        # training) get_frames restituisce semplicemente {} come per prima.
+        # per-episode ManiSkill seed, needed only for planning (PushCubeEnvWrapper.rollout/prepare) to reset to the exact scene; optional, falls back to {} if the file is missing
         seeds_path = self.data_path / "seeds.pkl"
         if seeds_path.exists():
             with open(seeds_path, "rb") as f:
@@ -60,9 +51,7 @@ class PushCubeDataset(TrajDataset):
         if self.seeds is not None:
             self.seeds = self.seeds[:n]
 
-        # proprio = solo il TCP (posizione del braccio), MAI cubo/goal: quelli
-        # il modello deve dedurli dal canale visivo, non riceverli come input
-        # numerico diretto (altrimenti il confronto tra encoder perde senso)
+        # proprio is TCP position only, never cube/goal: the model must infer those from vision, not receive them as direct numeric input
         self.proprios = self.states[..., :3].clone()
         self.with_velocity = with_velocity
         if with_velocity:
@@ -85,10 +74,7 @@ class PushCubeDataset(TrajDataset):
             self.proprio_mean = torch.zeros(self.proprio_dim)
             self.proprio_std = torch.ones(self.proprio_dim)
 
-        # state (tcp+cubo+goal, unita' grezze) non viene normalizzato nel
-        # training (solo proprio/azioni lo sono, come per PushT) - mean=0/std=1
-        # e' un no-op, usato da plan.py solo per metriche diagnostiche
-        # (Preprocessor.normalize_states), non per l'obiettivo di planning
+        # state (raw tcp+cube+goal) is left unnormalized (mean=0/std=1 is a no-op); only used by plan.py for diagnostic metrics, not the planning objective
         self.state_mean = torch.zeros(self.state_dim)
         self.state_std = torch.ones(self.state_dim)
 

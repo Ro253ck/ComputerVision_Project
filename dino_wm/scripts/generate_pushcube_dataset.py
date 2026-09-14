@@ -1,57 +1,3 @@
-"""
-Genera un dataset di rollout per PushCube-v1 (ManiSkill3) nel formato atteso
-da dino_wm (stesso layout di datasets/pusht_dset.py):
-
-    <out_dir>/{train,val}/
-        obses/episode_000.mp4, episode_001.mp4, ...
-        states.pth        # (N, T, state_dim) float32
-        abs_actions.pth   # (N, T, action_dim) float32
-        velocities.pth    # (N, T, vel_dim) float32  (velocita' lineare del TCP)
-        seq_lengths.pkl   # list[int] lunghe N, qui sempre = max_steps (lunghezza fissa)
-
-STEP A - una tantum, PRIMA di questo script (tooling ufficiale ManiSkill,
-non reimplementato qui perche' piu' affidabile del nostro codice):
-
-    python -m mani_skill.utils.download_demo PushCube-v1
-
-    python -m mani_skill.trajectory.replay_trajectory \\
-        --traj-path ~/.maniskill/demos/PushCube-v1/motionplanning/trajectory.h5 \\
-        --target-control-mode pd_ee_delta_pos \\
-        --obs-mode none \\
-        --save-traj \\
-        --num-envs 8
-
-    Questo produce trajectory.none.pd_ee_delta_pos.physx_cpu.h5 (+ .json con
-    i metadati, incluso il seed di reset di ogni episodio) con azioni gia'
-    nel control mode che usiamo per il world model. Il nome file include
-    anche obs-mode e sim-backend usati, non solo il control mode. Sono le
-    traiettorie "esperte" di base: questo script le RE-ESEGUE nel simulatore
-    aggiungendo rumore gaussiano alle azioni, cosi' da ottenere rollout
-    diversi tra loro pur restando vicini a una traiettoria che risolve il
-    task (stessa filosofia di data/pusht_noise).
-
-STEP B - questo script:
-
-    python generate_pushcube_dataset.py \\
-        --demo-path ~/.maniskill/demos/PushCube-v1/motionplanning/trajectory.none.pd_ee_delta_pos.physx_cpu.h5 \\
-        --out-dir /work/cvcs2026/LubiMoRe/dino_wm/data/pushcube_noise \\
-        --num-train-rollouts 10000 \\
-        --num-val-rollouts 50 \\
-        --max-steps 50 \\
-        --action-noise-std 0.05
-
-    train e val sono due pool INDIPENDENTI (stessa convenzione di
-    data/pusht_noise: train=18685, val=21 episodi fissi, non uno split
-    percentuale di un unico pool) - cosi' env.dataset.n_rollout=10000 in
-    training trova per intero i 10000 episodi di train che si aspetta.
-
-ATTENZIONE: script scritto senza poter eseguire ManiSkill in locale (non e'
-installato in questo sandbox) - alcuni nomi di chiavi in obs/info (es.
-"success", "tcp_pose") vanno verificati sul cluster. Lanciare PRIMA con
---num-rollouts 20 e controllare a occhio un paio di episode_XXX.mp4 e le
-shape dei tensori salvati, prima di lanciare il job da 10000.
-"""
-
 import argparse
 import json
 import pickle
@@ -64,20 +10,11 @@ import torch
 from tqdm import tqdm
 
 import gymnasium as gym
-import mani_skill.envs  # noqa: F401  (registra PushCube-v1 in gym)
+import mani_skill.envs  # noqa: F401  registers PushCube-v1 with gym
 
 
 def load_base_demos(demo_path):
-    """Carica le traiettorie esperte convertite (STEP A) come lista di dict
-    {seed, actions (T, action_dim), init_state}.
-
-    init_state e' lo stato COMPLETO della simulazione al tempo 0 (posa di
-    cubo/goal/tavolo + stato del braccio Panda), preso da env_states nel
-    file .h5. Serve per forzare la condizione iniziale esatta con
-    env.set_state_dict() invece di affidarsi a env.reset(seed=...): il seed
-    da solo non garantisce di riprodurre esattamente la stessa configurazione
-    per cui le azioni della demo erano state calcolate (es. rumore di
-    inizializzazione del robot non deterministico rispetto al seed)."""
+    """Loads the expert demo trajectories as a list of {seed, actions} dicts."""
     demo_path = Path(demo_path)
     with open(demo_path.with_suffix(".json")) as f:
         meta = json.load(f)
@@ -86,122 +23,84 @@ def load_base_demos(demo_path):
     with h5py.File(demo_path, "r") as f:
         for ep in meta["episodes"]:
             traj_id = f"traj_{ep['episode_id']}"
-            g = f[traj_id]
-            actions = np.array(g["actions"])  # (T, action_dim)
+            actions = np.array(f[traj_id]["actions"])  # (T, action_dim)
             seed = ep["reset_kwargs"].get("seed", ep["episode_seed"])
-
-            init_state = {
-                "actors": {
-                    name: np.array(g["env_states"]["actors"][name][0])
-                    for name in g["env_states"]["actors"].keys()
-                },
-                "articulations": {
-                    name: np.array(g["env_states"]["articulations"][name][0])
-                    for name in g["env_states"]["articulations"].keys()
-                },
-            }
-            demos.append({"seed": seed, "actions": actions, "init_state": init_state})
+            demos.append({"seed": seed, "actions": actions})
     return demos
 
 
-def _attempt_episode(env, base_actions, seed, max_steps, action_noise_std, rng):
-    """Un singolo tentativo di ri-eseguire la traiettoria esperta con rumore,
-    a lunghezza fissa max_steps. Una volta raggiunto il successo, congela
-    l'azione a zero (gripper escluso) per il resto dell'episodio invece di
-    continuare a spingere il cubo.
+def _read_state(env):
+    """Reads TCP pose, cube position, and goal position from the unwrapped ManiSkill env."""
+    u = env.unwrapped
+    tcp_pos = u.agent.tcp.pose.p.cpu().numpy().reshape(-1)
+    cube_pos = u.obj.pose.p.cpu().numpy().reshape(-1)
+    goal_pos = u.goal_region.pose.p.cpu().numpy().reshape(-1)
+    return tcp_pos, cube_pos, goal_pos
 
-    Ritorna anche se il successo e' stato raggiunto: la dinamica di contatto
-    rigido e' caotica, quindi anche con azioni identiche e seed identico due
-    esecuzioni possono divergere leggermente nel momento esatto del contatto
-    (verificato: le prime ~60 step combaciano byte per byte, poi una
-    differenza di ~1mm al contatto puo' far fallire la spinta) - per questo
-    chi chiama questa funzione ritenta se non riesce, vedi rollout_one_episode."""
-    obs, info = env.reset(seed=int(seed))
 
-    frames = []
-    tcp_positions = []
-    cube_positions = []
-    goal_positions = []
-    actions_taken = []
+def _render_frame(env):
+    """Renders one RGB frame, squeezing ManiSkill's batch dimension."""
+    frame = env.render()
+    if hasattr(frame, "cpu"):
+        frame = frame.cpu().numpy()
+    frame = np.asarray(frame)
+    if frame.ndim == 4:  # (1, H, W, 3) -> (H, W, 3)
+        frame = frame[0]
+    return frame
 
+
+def _stack_episode(frames, tcp_positions, cube_positions, goal_positions, actions_taken):
+    """Stacks per-step lists into arrays and builds the 9-dim state (tcp, cube, goal)."""
+    frames = np.stack(frames)
+    tcp_positions = np.stack(tcp_positions)
+    cube_positions = np.stack(cube_positions)
+    goal_positions = np.stack(goal_positions)
+    actions_taken = np.stack(actions_taken)
+    velocities = np.zeros_like(tcp_positions)
+    velocities[1:] = tcp_positions[1:] - tcp_positions[:-1]  # finite-difference TCP velocity
+    state = np.concatenate([tcp_positions, cube_positions, goal_positions], axis=-1)
+    return frames, state, actions_taken, velocities
+
+
+def _attempt_episode_train(env, base_actions, seed, max_steps, action_noise_std, rng):
+    """One attempt at replaying a noisy expert trajectory for the full max_steps; freezes to a zero action (gripper held) after first success instead of continuing to push."""
+    env.reset(seed=int(seed))
+    frames, tcp_positions, cube_positions, goal_positions, actions_taken = [], [], [], [], []
     action_dim = env.action_space.shape[-1]
     success_reached = False
     first_success_step = None
-    # ultima azione del gripper comandata dalla demo (l'ultima colonna
-    # dell'action space, tipicamente ~-1 = chiuso per tutta la traiettoria
-    # in PushCube): da mantenere anche a movimento congelato, altrimenti
-    # azzerarla di colpo (da -1 a 0) da' uno scossone al gripper che
-    # disturba il cubo subito dopo il successo, vanificandolo
-    last_gripper_action = base_actions[min(len(base_actions), 1) - 1, -1] if len(base_actions) > 0 else 0.0
+    last_gripper_action = base_actions[min(len(base_actions), 1) - 1, -1] if len(base_actions) > 0 else 0.0  # held steady once frozen, so it doesn't shock the cube
 
     for t in range(max_steps):
-        if success_reached:
+        if success_reached or t >= len(base_actions):
             action = np.zeros(action_dim, dtype=np.float32)
             action[-1] = last_gripper_action
-        elif t < len(base_actions):
+        else:
             noise = rng.normal(0, action_noise_std, size=action_dim).astype(np.float32)
             action = np.clip(base_actions[t] + noise, -1.0, 1.0)
             last_gripper_action = action[-1]
-        else:
-            # traiettoria esperta piu' corta di max_steps: resta fermo, ma
-            # mantieni comunque il gripper com'era, non azzerarlo di colpo
-            action = np.zeros(action_dim, dtype=np.float32)
-            action[-1] = last_gripper_action
 
-        obs, rew, terminated, truncated, info = env.step(action)
+        _, _, _, _, info = env.step(action)
         if bool(info.get("success", False)) and not success_reached:
             success_reached = True
             first_success_step = t
 
-        frame = env.render()  # rgb_array mode; ManiSkill3 e' vettorizzato, quindi
-        if hasattr(frame, "cpu"):  # puo' essere un tensore torch su GPU con una
-            frame = frame.cpu().numpy()  # dimensione di batch anche con un solo env
-        frame = np.asarray(frame)
-        if frame.ndim == 4:  # (1, H, W, 3) -> (H, W, 3)
-            frame = frame[0]
-        frames.append(frame)
-
-        # stato "privilegiato": posa TCP + posizione cubo + posizione goal
-        # NB: le chiavi esatte dipendono dalla versione di ManiSkill, verificare
-        # con `print(env.unwrapped.get_state_dict().keys())` sul cluster.
-        unwrapped = env.unwrapped
-        tcp_pos = unwrapped.agent.tcp.pose.p.cpu().numpy().reshape(-1)
-        cube_pos = unwrapped.obj.pose.p.cpu().numpy().reshape(-1)
-        goal_pos = unwrapped.goal_region.pose.p.cpu().numpy().reshape(-1)
-
+        frames.append(_render_frame(env))
+        tcp_pos, cube_pos, goal_pos = _read_state(env)
         tcp_positions.append(tcp_pos)
         cube_positions.append(cube_pos)
         goal_positions.append(goal_pos)
         actions_taken.append(action)
 
-    frames = np.stack(frames)  # (T, H, W, 3)
-    tcp_positions = np.stack(tcp_positions)  # (T, 3)
-    cube_positions = np.stack(cube_positions)  # (T, 3)
-    goal_positions = np.stack(goal_positions)  # (T, 3)
-    actions_taken = np.stack(actions_taken)  # (T, action_dim)
-
-    # velocita' del TCP come derivata finita delle posizioni (coerente con
-    # come pusht_dset ricava le "velocities" per il proprio)
-    velocities = np.zeros_like(tcp_positions)
-    velocities[1:] = tcp_positions[1:] - tcp_positions[:-1]
-
-    # stato = [tcp_pos(3), cube_pos(3), goal_pos(3)]  -> state_dim = 9
-    state = np.concatenate([tcp_positions, cube_positions, goal_positions], axis=-1)
-
+    frames, state, actions_taken, velocities = _stack_episode(frames, tcp_positions, cube_positions, goal_positions, actions_taken)
     return frames, state, actions_taken, velocities, success_reached, first_success_step
 
 
-def rollout_one_episode(env, base_actions, seed, init_state, max_steps, action_noise_std, rng,
-                         max_retry=10, success_dist_threshold=0.1):
-    # success_dist_threshold=0.1 = env.unwrapped.goal_radius reale di
-    # PushCube-v1 (verificato sul cluster), non un valore a caso
-    """Chiama _attempt_episode fino a max_retry volte, tenendo il primo
-    tentativo che raggiunge il successo (o quello con la distanza finale
-    cubo-goal minore, se nessuno riesce entro max_retry tentativi)."""
-    best = None
-    best_dist = np.inf
-    for attempt in range(max_retry):
-        frames, state, actions_taken, velocities, success, first_success_step = _attempt_episode(
+def rollout_one_episode_train(env, base_actions, seed, max_steps, action_noise_std, rng, max_retry, success_dist_threshold=0.1):
+    """Retries the train attempt up to max_retry times, keeping the closest-to-success one if none actually succeeds."""
+    best, best_dist = None, np.inf
+    for _ in range(max_retry):
+        frames, state, actions_taken, velocities, success, first_success_step = _attempt_episode_train(
             env, base_actions, seed, max_steps, action_noise_std, rng,
         )
         final_dist = np.linalg.norm(state[-1, 3:6] - state[-1, 6:9])
@@ -210,10 +109,59 @@ def rollout_one_episode(env, base_actions, seed, init_state, max_steps, action_n
         if final_dist < best_dist:
             best_dist = final_dist
             best = (frames, state, actions_taken, velocities, first_success_step)
-    # nessun tentativo riuscito entro max_retry: teniamo comunque il migliore,
-    # invece di scartare l'episodio (in produzione andrebbe loggato quanti
-    # episodi falliscono anche dopo i retry, per capire se max_retry va alzato)
-    return best
+    return best  # kept even though it never succeeded, training still benefits from the variation
+
+
+def _attempt_episode_val(env, base_actions, seed, max_steps, action_noise_std, rng):
+    """Runs one attempt only up to the first success, then stops simulating and pads by duplicating the last frame/state up to max_steps; returns None if success is never reached."""
+    env.reset(seed=int(seed))
+    frames, tcp_positions, cube_positions, goal_positions, actions_taken = [], [], [], [], []
+    action_dim = env.action_space.shape[-1]
+    success_reached = False
+    first_success_step = None
+
+    for t in range(min(max_steps, len(base_actions))):
+        noise = rng.normal(0, action_noise_std, size=action_dim).astype(np.float32)
+        action = np.clip(base_actions[t] + noise, -1.0, 1.0)
+        _, _, _, _, info = env.step(action)
+
+        frames.append(_render_frame(env))
+        tcp_pos, cube_pos, goal_pos = _read_state(env)
+        tcp_positions.append(tcp_pos)
+        cube_positions.append(cube_pos)
+        goal_positions.append(goal_pos)
+        actions_taken.append(action)
+
+        if bool(info.get("success", False)):
+            success_reached = True
+            first_success_step = t
+            break  # stop simulating as soon as the task is solved
+
+    if not success_reached:
+        return None
+
+    last_frame, last_tcp, last_cube, last_goal = frames[-1], tcp_positions[-1], cube_positions[-1], goal_positions[-1]
+    last_gripper = actions_taken[-1][-1]
+    while len(frames) < max_steps:  # pad the rest of the episode by duplicating the successful frame, never by simulating further
+        frames.append(last_frame.copy())
+        tcp_positions.append(last_tcp.copy())
+        cube_positions.append(last_cube.copy())
+        goal_positions.append(last_goal.copy())
+        pad_action = np.zeros(action_dim, dtype=np.float32)
+        pad_action[-1] = last_gripper
+        actions_taken.append(pad_action)
+
+    frames, state, actions_taken, velocities = _stack_episode(frames, tcp_positions, cube_positions, goal_positions, actions_taken)
+    return frames, state, actions_taken, velocities, first_success_step
+
+
+def rollout_one_episode_val(env, base_actions, seed, max_steps, action_noise_std, rng, max_retry):
+    """Retries until an attempt actually succeeds; unlike train, a val episode that never succeeds is not usable."""
+    for attempt in range(max_retry):
+        result = _attempt_episode_val(env, base_actions, seed, max_steps, action_noise_std, rng)
+        if result is not None:
+            return (*result, attempt + 1)
+    return None
 
 
 def write_episode_video(path, frames, fps=10):
@@ -223,7 +171,7 @@ def write_episode_video(path, frames, fps=10):
     writer.close()
 
 
-def save_split_tensors(split_dir, states, actions, velocities, seq_lengths):
+def save_split_tensors(split_dir, states, actions, velocities, seq_lengths, seeds):
     split_dir = Path(split_dir)
     if len(states) == 0:
         return
@@ -232,113 +180,97 @@ def save_split_tensors(split_dir, states, actions, velocities, seq_lengths):
     torch.save(torch.tensor(np.stack(velocities), dtype=torch.float32), split_dir / "velocities.pth")
     with open(split_dir / "seq_lengths.pkl", "wb") as f:
         pickle.dump(list(seq_lengths), f)
+    with open(split_dir / "seeds.pkl", "wb") as f:
+        pickle.dump(list(seeds), f)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--demo-path", type=str, required=True,
-                         help="trajectory.pd_ee_delta_pos.h5 prodotto dallo STEP A")
+    parser.add_argument("--demo-path", type=str, required=True, help="trajectory .h5 produced by ManiSkill's motion-planning + replay step")
     parser.add_argument("--out-dir", type=str, required=True)
-    # train e val sono due pool INDIPENDENTI, non uno split percentuale di un
-    # unico pool: e' la stessa convenzione di data/pusht_noise (train=18685,
-    # val=21 episodi fissi). Se poi in training usi env.dataset.n_rollout=10000,
-    # il train pool deve contenerne almeno 10000 per intero.
-    parser.add_argument("--num-train-rollouts", type=int, default=10000)
+    parser.add_argument("--num-train-rollouts", type=int, default=10000, help="train and val are independent pools, not a split of one")
     parser.add_argument("--num-val-rollouts", type=int, default=50)
-    parser.add_argument("--max-steps", type=int, default=50,
-                         help="lunghezza fissa di ogni rollout")
+    parser.add_argument("--max-steps", type=int, default=150, help="fixed length of every saved rollout")
     parser.add_argument("--action-noise-std", type=float, default=0.05)
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--success-buffer", type=int, default=10,
-                         help="quanti step extra tenere (in seq_lengths) dopo il primo "
-                              "successo, invece di continuare fino a max_steps")
+    parser.add_argument("--success-buffer", type=int, default=10, help="extra steps kept in train seq_lengths after first success, instead of the full max_steps")
+    parser.add_argument("--max-retry-train", type=int, default=10, help="attempts per train episode before keeping the closest-to-success one anyway")
+    parser.add_argument("--max-retry-val", type=int, default=50, help="attempts per val episode before giving up (val requires an actual success)")
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
-
     demos = load_base_demos(args.demo_path)
-    print(f"Caricate {len(demos)} traiettorie esperte di base da {args.demo_path}")
+    print(f"Loaded {len(demos)} base expert trajectories from {args.demo_path}")
 
     env = gym.make(
         "PushCube-v1",
-        obs_mode="none",           # non ci serve l'obs del simulatore: renderizziamo noi i frame
+        obs_mode="none",  # we render frames ourselves, no simulator obs needed
         control_mode="pd_ee_delta_pos",
         render_mode="rgb_array",
-        sim_backend="cpu",         # un env alla volta: niente bisogno del backend gpu vettorizzato
+        sim_backend="cpu",  # one env at a time, no need for the GPU-vectorized backend
         max_episode_steps=args.max_steps,
-        # risoluzione della camera di rendering "human"/rgb_array, coerente
-        # col resto della pipeline (default ManiSkill era 512x512)
         human_render_camera_configs=dict(width=args.img_size, height=args.img_size),
     )
 
-    # split train/val deciso PRIMA di generare, cosi' possiamo scrivere ogni
-    # video su disco subito e non tenere mai in RAM piu' di un rollout di
-    # frame per volta (10000 rollout x 50 step x 224x224x3 sarebbero ~75GB
-    # se accumulati tutti insieme prima di salvare)
-    # train e val sono due pool indipendenti: il primo blocco di indici va
-    # in train, il secondo (che continua a ciclare sulle demo/seed) in val.
-    n_train = args.num_train_rollouts
-    n_val = args.num_val_rollouts
-    split_ranges = [("train", range(0, n_train)), ("val", range(n_train, n_train + n_val))]
-
     out_dir = Path(args.out_dir)
-    split_states = {"train": [], "val": []}
-    split_actions = {"train": [], "val": []}
-    split_vel = {"train": [], "val": []}
-    split_seq_lengths = {"train": [], "val": []}
-    n_never_succeeded = {"train": 0, "val": 0}
     for split in ("train", "val"):
         (out_dir / split / "obses").mkdir(parents=True, exist_ok=True)
 
-    for split, idx_range in split_ranges:
-        for ep_idx, i in enumerate(tqdm(idx_range, desc=f"rollout ({split})")):
-            base = demos[i % len(demos)]
-            # IMPORTANTE: il seed deve essere quello ORIGINALE della demo, non
-            # uno diverso per ogni rollout - il seed determina la posizione
-            # random di cubo/goal nella scena, e le azioni registrate in
-            # base["actions"] sono state pianificate apposta per QUELLA
-            # configurazione iniziale. Cambiare seed = azioni "cieche" su una
-            # scena diversa da quella per cui erano state calcolate -> quasi
-            # mai successo. La diversita' tra i rollout viene solo dal rumore
-            # sulle azioni, non dal seed.
-            frames, state, actions, vel, first_success_step = rollout_one_episode(
-                env, base["actions"], seed=base["seed"], init_state=base["init_state"],
-                max_steps=args.max_steps, action_noise_std=args.action_noise_std, rng=rng,
-            )
+    # train: original behaviour, an episode may keep pushing without ever succeeding
+    train_states, train_actions, train_vel, train_seq_lengths, train_seeds = [], [], [], [], []
+    n_never_succeeded = 0
+    for ep_idx in tqdm(range(args.num_train_rollouts), desc="rollout (train)"):
+        base = demos[ep_idx % len(demos)]  # seed must be the demo's own: it fixes the cube/goal layout the recorded actions were planned for
+        frames, state, actions, vel, first_success_step = rollout_one_episode_train(
+            env, base["actions"], seed=base["seed"], max_steps=args.max_steps,
+            action_noise_std=args.action_noise_std, rng=rng, max_retry=args.max_retry_train,
+        )
+        write_episode_video(out_dir / "train" / "obses" / f"episode_{ep_idx:03d}.mp4", frames)
+        del frames
 
-            write_episode_video(out_dir / split / "obses" / f"episode_{ep_idx:03d}.mp4", frames)
-            del frames  # libera subito la parte pesante in RAM
+        if first_success_step is None:
+            seq_len = args.max_steps
+            n_never_succeeded += 1
+        else:
+            seq_len = min(first_success_step + args.success_buffer + 1, args.max_steps)  # trims the frozen post-success tail out of training windows
 
-            # lunghezza EFFETTIVA salvata in seq_lengths: fino a poco dopo il
-            # primo successo, non fino a max_steps - cosi' le finestre di
-            # training/planning (TrajSlicerDataset, che usa get_seq_length())
-            # non pescano mai dalla "coda congelata" post-successo, che
-            # diluisce/degrada il segnale utile (vedi discussione). Se
-            # l'episodio non ha mai avuto successo (capita con i casi piu'
-            # duri anche dopo i retry), teniamo la lunghezza piena: non c'e'
-            # una vera coda congelata da tagliare in quel caso.
-            if first_success_step is None:
-                seq_len = args.max_steps
-                n_never_succeeded[split] += 1
-            else:
-                seq_len = min(first_success_step + args.success_buffer + 1, args.max_steps)
+        train_states.append(state)
+        train_actions.append(actions)
+        train_vel.append(vel)
+        train_seq_lengths.append(seq_len)
+        train_seeds.append(int(base["seed"]))
 
-            split_states[split].append(state)
-            split_actions[split].append(actions)
-            split_vel[split].append(vel)
-            split_seq_lengths[split].append(seq_len)
+    save_split_tensors(out_dir / "train", train_states, train_actions, train_vel, train_seq_lengths, train_seeds)
+    avg_len = sum(train_seq_lengths) / len(train_seq_lengths)
+    print(f"train: {len(train_states)} rollouts saved to {out_dir / 'train'} (avg length {avg_len:.1f}/{args.max_steps}, never succeeded: {n_never_succeeded})")
+
+    # val: every episode must succeed and hold the goal for the full length
+    val_states, val_actions, val_vel, val_seq_lengths, val_seeds = [], [], [], [], []
+    retries_used = []
+    for ep_idx in tqdm(range(args.num_val_rollouts), desc="rollout (val)"):
+        base = demos[ep_idx % len(demos)]
+        result = rollout_one_episode_val(
+            env, base["actions"], seed=base["seed"], max_steps=args.max_steps,
+            action_noise_std=args.action_noise_std, rng=rng, max_retry=args.max_retry_val,
+        )
+        if result is None:
+            raise RuntimeError(f"val episode {ep_idx} never succeeded within {args.max_retry_val} attempts; raise --max-retry-val")
+        frames, state, actions, vel, first_success_step, n_attempts = result
+        write_episode_video(out_dir / "val" / "obses" / f"episode_{ep_idx:03d}.mp4", frames)
+        del frames
+
+        val_states.append(state)
+        val_actions.append(actions)
+        val_vel.append(vel)
+        val_seq_lengths.append(args.max_steps)  # always the full length: the tail is a genuine held success, safe to use as a goal at any horizon
+        val_seeds.append(int(base["seed"]))
+        retries_used.append(n_attempts)
+
     env.close()
 
-    for split in ("train", "val"):
-        save_split_tensors(
-            out_dir / split, split_states[split], split_actions[split], split_vel[split],
-            seq_lengths=split_seq_lengths[split],
-        )
-        avg_len = sum(split_seq_lengths[split]) / len(split_seq_lengths[split])
-        print(f"{split}: {len(split_states[split])} rollout salvati in {out_dir / split}"
-              f" (lunghezza media {avg_len:.1f}/{args.max_steps},"
-              f" mai andati a successo: {n_never_succeeded[split]})")
+    save_split_tensors(out_dir / "val", val_states, val_actions, val_vel, val_seq_lengths, val_seeds)
+    print(f"val: {len(val_states)} rollouts saved to {out_dir / 'val'} (attempts per episode: min={min(retries_used)}, mean={sum(retries_used) / len(retries_used):.1f}, max={max(retries_used)})")
 
 
 if __name__ == "__main__":

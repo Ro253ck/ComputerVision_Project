@@ -287,7 +287,7 @@ class PlanWorkspace:
                 obs, act, state, e_info = self.dset[traj_id]
                 max_offset = obs["visual"].shape[0] - traj_len
             state = state.numpy()
-            offset = random.randint(0, max_offset)
+            offset = 0 if self.env_name == "pushcube" else random.randint(0, max_offset)
             obs = {
                 key: arr[offset : offset + traj_len]
                 for key, arr in obs.items()
@@ -415,7 +415,7 @@ class PlanWorkspace:
 
 def load_ckpt(snapshot_path, device):
     with snapshot_path.open("rb") as f:
-        return torch.load(f, map_location=device)   # dict di state_dict (+ 'epoch')
+        return torch.load(f, map_location=device)   # dict of state_dicts (+ 'epoch')
 
 
 def load_model(model_ckpt, train_cfg, num_action_repeat, device, dset):
@@ -427,7 +427,7 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device, dset):
     if "encoder" in payload:
         encoder.load_state_dict(payload["encoder"])
 
-    # proprio encoder: in_chans letto dal checkpoint stesso (non dal dataset)
+    # proprio encoder: in_chans read from the checkpoint itself, not the dataset
     proprio_in_chans = payload["proprio_encoder"]["patch_embed.weight"].shape[1]
     proprio_encoder = hydra.utils.instantiate(
         train_cfg.proprio_encoder,
@@ -437,7 +437,7 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device, dset):
     proprio_encoder.load_state_dict(payload["proprio_encoder"])
     proprio_emb_dim = proprio_encoder.emb_dim
 
-    # action encoder: in_chans letto dal checkpoint stesso
+    # action encoder: in_chans read from the checkpoint itself
     action_in_chans = payload["action_encoder"]["patch_embed.weight"].shape[1]
     action_encoder = hydra.utils.instantiate(
         train_cfg.action_encoder,
@@ -447,7 +447,7 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device, dset):
     action_encoder.load_state_dict(payload["action_encoder"])
     action_emb_dim = action_encoder.emb_dim
 
-    # predictor (stessa logica di num_patches/dim di train.py:init_models)
+    # predictor (same num_patches/dim logic as train.py:init_models)
     if encoder.latent_ndim == 1:
         num_patches = 1
     else:
@@ -466,17 +466,15 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device, dset):
         ) * train_cfg.concat_dim,
     )
     if "predictor" not in payload:
-        raise ValueError("Predictor non trovato nel checkpoint")
+        raise ValueError("Predictor not found in checkpoint")
     predictor.load_state_dict(payload["predictor"])
 
-    # decoder (None se il checkpoint non ne ha uno - setup normale, solo
-    # predictor allenato; presente solo per i run "solo decoder" fatti apposta
-    # per la visualizzazione real-vs-ricostruita in planning/evaluator.py)
+    # decoder: None unless the checkpoint has one (only the "decoder-only" runs used for real-vs-reconstructed visualization in planning/evaluator.py train it)
     decoder = None
     if train_cfg.has_decoder:
         decoder = hydra.utils.instantiate(train_cfg.decoder, emb_dim=encoder.emb_dim)
         if "decoder" not in payload:
-            raise ValueError("has_decoder=True ma 'decoder' non trovato nel checkpoint")
+            raise ValueError("has_decoder=True but 'decoder' not found in checkpoint")
         decoder.load_state_dict(payload["decoder"])
 
     model = hydra.utils.instantiate(
@@ -572,26 +570,10 @@ def planning_main(cfg_dict):
     #        ]
     #    )
     else:
-        # DINO_WM_FORCE_FORK=1 e' una via di fuga SOLO per test diagnostici
-        # (verificare se "fork" funziona per pushcube su una GPU dedicata,
-        # invece di quella condivisa usata nei primi test) - normalmente non
-        # va impostata, il default (spawn per pushcube) resta quello giusto.
+        # DINO_WM_FORCE_FORK=1 is a diagnostic-only escape hatch, normally unset; default (spawn for pushcube) is correct
         force_fork_test = os.environ.get("DINO_WM_FORCE_FORK") == "1"
         if model_cfg.env.name == "pushcube" and not force_fork_test:
-            # SubprocVectorEnv usa "fork" di default (Linux). Il processo
-            # principale carica pero' il modello su GPU prima di creare i
-            # sottoprocessi: un figlio "fork" eredita quel contesto CUDA gia'
-            # inizializzato, causa nota di blocchi silenziosi con librerie
-            # che usano la GPU nei figli (il rendering di ManiSkill/SAPIEN).
-            # "spawn" crea processi puliti ed e' il metodo raccomandato da
-            # PyTorch per multiprocessing+CUDA - ma ha un costo: ogni figlio
-            # si crea un proprio contesto CUDA (~700MB l'uno), quindi lo
-            # forziamo SOLO per pushcube. PushT/Wall restano su "fork"
-            # (default): i loro simulatori sono puro CPU, i figli non
-            # toccano mai CUDA, quindi "fork" e' sia sicuro che senza
-            # l'overhead di memoria di "spawn" (verificato: con "spawn"
-            # globale, 50 sottoprocessi PushT hanno esaurito 45GB di GPU
-            # solo di overhead, senza fare nulla).
+            # SubprocVectorEnv defaults to "fork" on Linux, but a forked child inherits the parent's already-initialized CUDA context, which silently hangs GPU-using libraries like ManiSkill/SAPIEN's renderer; "spawn" avoids this at the cost of ~700MB extra CUDA context per child, so we force it only for pushcube (PushT/Wall's simulators are CPU-only and stay on the cheaper default "fork")
             import multiprocessing
             multiprocessing.set_start_method("spawn", force=True)
         env = SubprocVectorEnv(
