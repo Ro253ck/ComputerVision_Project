@@ -142,6 +142,17 @@ class PlanEvaluator:  # evaluator for planning
                 save_video=save_video,
                 filename=filename,
             )
+        elif save_video:
+            # No decoder available: we cannot decode the world model's imagined
+            # rollout to pixels, but the executed (real) rollout comes straight
+            # from the simulator's own renderer and needs no decoder at all.
+            e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
+            e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
+            self._save_real_rollout_video(
+                e_visuals=e_visuals,
+                successes=successes,
+                filename=filename,
+            )
 
         return logs, successes, e_obses, e_states
 
@@ -185,6 +196,40 @@ class PlanEvaluator:  # evaluator for planning
 
         return logs, successes
 
+    def _save_real_rollout_video(self, e_visuals, successes, filename=""):
+        """
+        Save the actually-executed rollout (real simulator frames) as one
+        video per episode, next to the goal frame. Does not need a trained
+        decoder, unlike _plot_rollout_compare (which additionally overlays
+        the world model's decoded "imagined" rollout).
+        e_visuals: (b, t, c, h, w)
+        """
+        e_visuals = e_visuals[: self.n_plot_samples]
+        goal_visual = self.obs_g["visual"][: self.n_plot_samples]
+        goal_visual = self.preprocessor.transform_obs_visual(goal_visual)
+        correction = 0.3  # to distinguish env visuals from the goal frame
+
+        for idx in range(e_visuals.shape[0]):
+            success_tag = "success" if successes[idx] else "failure"
+            frames = []
+            for i in range(e_visuals.shape[1]):
+                e_obs = e_visuals[idx, i, ...]
+                frame = torch.cat(
+                    [e_obs.cpu() - correction, goal_visual[idx, 0] - correction], dim=2
+                )
+                frame = rearrange(frame, "c h w -> h w c")
+                frame = frame.detach().cpu().numpy()
+                frames.append(frame)
+            video_writer = imageio.get_writer(
+                f"{filename}_{idx}_{success_tag}.mp4", fps=12
+            )
+            for frame in frames:
+                frame = frame * 2 - 1 if frame.min() >= 0 else frame
+                video_writer.append_data(
+                    (((np.clip(frame, -1, 1) + 1) / 2) * 255).astype(np.uint8)
+                )
+            video_writer.close()
+
     def _plot_rollout_compare(
         self, e_visuals, i_visuals, successes, save_video=False, filename=""
     ):
@@ -194,8 +239,8 @@ class PlanEvaluator:  # evaluator for planning
         i_visuals: (b, t, h, w, c)
         goal: (b, h, w, c)
         """
-        e_visuals = e_visuals[: self.n_plot_samples]
-        i_visuals = i_visuals[: self.n_plot_samples]
+        e_visuals = e_visuals[: self.n_plot_samples].cpu()
+        i_visuals = i_visuals[: self.n_plot_samples].cpu()
         goal_visual = self.obs_g["visual"][: self.n_plot_samples]
         goal_visual = self.preprocessor.transform_obs_visual(goal_visual)
 

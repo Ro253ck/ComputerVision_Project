@@ -15,13 +15,9 @@ def generate_mask_matrix(npatch, nwindow):
     ones = torch.ones(npatch, npatch)
     rows = []
     for i in range(nwindow):
-        # [lista] * int, supponiamo int=3 ritorna : [lista,lista,lista]. La somma di due lista ritorna la concatenazione di esse.
-        row = torch.cat([ones] * (i+1) + [zeros] * (nwindow - i-1), dim=1) #Otteniamo una matrice n_patch *(nwindow*npatch)
+        row = torch.cat([ones] * (i+1) + [zeros] * (nwindow - i-1), dim=1)  # gives a (npatch, nwindow*npatch) row block
         rows.append(row)
-    # torch.cat(rows, dim=0) impila le righe verticalmente → matrice (nwindow*npatch, nwindow*npatch)
-    # unsqueeze(0).unsqueeze(0) aggiunge le dimensioni batch e heads → (1, 1, nwindow*npatch, nwindow*npatch)
-    # shape finale compatibile con la attention matrix (B, heads, T, T)
-    mask = torch.cat(rows, dim=0).unsqueeze(0).unsqueeze(0)
+    mask = torch.cat(rows, dim=0).unsqueeze(0).unsqueeze(0)  # stack rows into (nwindow*npatch, nwindow*npatch), then add batch+heads dims to match the attention matrix (B, heads, T, T)
     return mask
 
 class FeedForward(nn.Module):
@@ -43,36 +39,35 @@ class Attention(nn.Module):
     def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
         super().__init__()
         inner_dim = dim_head *  heads
-        project_out = not (heads == 1 and dim_head == dim) #Se ho solo una head e la dimensione interna è identica alla dimensione dell'input non c'è bisogno di fare alcuna proiezione
+        project_out = not (heads == 1 and dim_head == dim)  # no projection needed if single head with inner dim already matching input dim
 
         self.heads = heads
-        self.scale = dim_head ** -0.5 #Termine per cui andremo a dividere la matrice di similarità per non saturare la softmax
+        self.scale = dim_head ** -0.5  # divides the similarity matrix to keep the softmax from saturating
 
         self.norm = nn.LayerNorm(dim)
 
         self.attend = nn.Softmax(dim = -1)
         self.dropout = nn.Dropout(dropout)
 
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False) #Produce Q, K e V tutto in una volta
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)  # produces Q, K, V in one go
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout)
-        ) if project_out else nn.Identity() #Effettua la proiezione solo se project_out è true altrimenti la dimensione è gia corretta
-        #Maschera che viene creata una sola volta nell init è utilizzata tutte le volte necessarie. Viene messa su GPU.
-        self.bias = generate_mask_matrix(NUM_PATCHES, NUM_FRAMES).to('cuda')
+        ) if project_out else nn.Identity()  # only project if needed, otherwise the dim is already right
+        self.bias = generate_mask_matrix(NUM_PATCHES, NUM_FRAMES).to('cuda')  # built once in init, reused every forward call, kept on GPU
 
     def forward(self, x):
         (
-            B,#Grandezza del batch
-            T,#Numero totale di token -> num_patches x frames
-            C,#Dimension embedding
+            B,  # batch size
+            T,  # total tokens = num_patches x frames
+            C,  # embedding dim
         ) = x.size()
 
         x = self.norm(x)
 
-        qkv = self.to_qkv(x).chunk(3, dim = -1)  #(B, 588, 1536)  →  3 tensori da (B, 588, 512) ciascuno. Chunk restituisce una tupla.
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv) # Per ogni tupla separe il numero di teste per i parametri di ogni testa
+        qkv = self.to_qkv(x).chunk(3, dim = -1)  # (B, 588, 1536) -> 3 tensors of (B, 588, 512), chunk returns a tuple
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)  # split each of Q/K/V into per-head chunks
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         # apply causal mask
@@ -82,7 +77,7 @@ class Attention(nn.Module):
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)') #unisco le teste
+        out = rearrange(out, 'b h n d -> b n (h d)')  # merge heads back together
         return self.to_out(out) 
 
 class Transformer(nn.Module):
@@ -98,7 +93,7 @@ class Transformer(nn.Module):
 
     def forward(self, x):
         for attn, ff in self.layers:
-            x = attn(x) + x #Residual connection
+            x = attn(x) + x  # residual connection
             x = ff(x) + x
 
         return self.norm(x)
@@ -113,8 +108,7 @@ class ViTPredictor(nn.Module):
         NUM_FRAMES = num_frames
         NUM_PATCHES = num_patches
 
-        #nn.Parameter significa che è un tensore apprendibile che viene aggiornato tramie backprop
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames * (num_patches), dim)) # dim for the pos encodings
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames * (num_patches), dim))  # nn.Parameter: a learnable tensor updated via backprop
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
         self.pool = pool

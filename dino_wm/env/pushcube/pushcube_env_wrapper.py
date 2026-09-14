@@ -1,41 +1,22 @@
-"""
-Wrapper per PushCube-v1 (ManiSkill3) con la stessa interfaccia di
-env/pusht/pusht_wrapper.py e env/wall/wall_env_wrapper.py, cosi' da poter
-essere usato da plan.py senza modifiche al resto della pipeline.
-
-Differenza importante rispetto a PushT/Wall: quei simulatori sono a bassa
-dimensionalita' e il loro stato compatto basta a ricostruire l'intera scena
-(env.set_init_state(state) funziona). ManiSkill no: il nostro state a 9
-valori (tcp+cubo+goal) non contiene gli angoli dei giunti del robot ne' i
-quaternioni di orientamento, quindi non e' invertibile in una configurazione
-fisica esatta. Usiamo invece il SEED dell'episodio (salvato a parte in
-data/pushcube_noise/{train,val}/seeds.pkl, vedi scripts/recover_pushcube_seeds.py)
-con env.reset(seed=...), che riproduce la scena iniziale byte per byte
-(verificato durante il debug della generazione dataset).
-
-update_env() riceve il seed dal dataset (via PushCubeDataset che lo espone
-nel 4o elemento restituito da __getitem__) e lo salva; rollout()/prepare()
-lo usano al posto dello stato compatto per il reset.
-"""
 import numpy as np
 import gymnasium
-import mani_skill.envs  # noqa: F401  (registra PushCube-v1 in gymnasium)
+import mani_skill.envs  # noqa: F401  registers PushCube-v1 with gymnasium
 
-# gym "vecchio" (quello usato dal sistema di registrazione in env/__init__.py
-# e da plan.py per gym.make("pushcube", ...)) e' un pacchetto DIVERSO da
-# gymnasium (quello di ManiSkill) - PushTEnv/DotWall ereditano entrambi da
-# gym.Env per soddisfare l'interfaccia che il vecchio gym.make() si aspetta
-# (es. l'attributo .unwrapped); facciamo lo stesso qui.
+# legacy gym (used by env/__init__.py's registration and plan.py's gym.make("pushcube", ...)) is a different package from gymnasium (ManiSkill's); PushTEnv/DotWall both inherit from gym.Env for the same reason, so we do too here
 import gym as legacy_gym
 from gym import spaces
 
 from utils import aggregate_dct
 
 ENV_ACTION_DIM = 4  # xyz end-effector delta + gripper
-GOAL_RADIUS = 0.1   # env.unwrapped.goal_radius reale di PushCube-v1, verificato
+GOAL_RADIUS = 0.1  # PushCube-v1's real env.unwrapped.goal_radius, verified on the cluster
 
 
 class PushCubeEnvWrapper(legacy_gym.Env):
+    """Wraps PushCube-v1 (ManiSkill3) with the same interface as env/pusht and env/wall, so plan.py needs no changes to use it.
+
+    Unlike PushT/Wall, ManiSkill's scene can't be rebuilt from the compact 9-dim state (it lacks joint angles/orientation quaternions), so we reset with the episode's own seed (see PushCubeDataset.seeds) instead."""
+
     def __init__(self, img_size=224, **kwargs):
         self._env = gymnasium.make(
             "PushCube-v1",
@@ -56,14 +37,12 @@ class PushCubeEnvWrapper(legacy_gym.Env):
         self._prev_tcp = None
 
     def update_env(self, env_info):
-        """env_info arriva da PushCubeDataset.get_frames come {'seed': int},
-        gia' smistato per-traiettoria dal livello di vettorizzazione."""
+        """Receives {'seed': int} from PushCubeDataset.get_frames, already routed per-trajectory."""
         if "seed" in env_info:
             self._episode_seed = int(env_info["seed"])
 
     def eval_state(self, goal_state, cur_state):
-        """successo = cubo entro GOAL_RADIUS dal goal, come definito
-        internamente da ManiSkill per PushCube-v1 (env.unwrapped.goal_radius)."""
+        """Success = cube within GOAL_RADIUS of the goal, matching ManiSkill's own PushCube-v1 criterion."""
         cube_pos = cur_state[3:6]
         goal_pos = cur_state[6:9]
         dist_to_goal = np.linalg.norm(cube_pos - goal_pos)
@@ -86,19 +65,17 @@ class PushCubeEnvWrapper(legacy_gym.Env):
         if hasattr(frame, "cpu"):
             frame = frame.cpu().numpy()
         frame = np.asarray(frame)
-        if frame.ndim == 4:  # (1, H, W, 3) -> (H, W, 3), ManiSkill3 e' vettorizzato
+        if frame.ndim == 4:  # (1, H, W, 3) -> (H, W, 3), ManiSkill3 is vectorized
             frame = frame[0]
         return frame
 
     def prepare(self, seed, init_state):
-        """Reset alla scena esatta dell'episodio. init_state non e' usabile
-        direttamente per ManiSkill (vedi docstring del modulo) - usiamo il
-        seed salvato da update_env se disponibile, altrimenti seed passato."""
+        """Resets to the episode's exact scene; init_state is unused (see class docstring), we reset by seed instead."""
         reset_seed = self._episode_seed if self._episode_seed is not None else int(seed)
         self._env.reset(seed=reset_seed)
         state = self._read_state()
         self._prev_tcp = state[:3].copy()
-        proprio = np.concatenate([state[:3], np.zeros(3, dtype=np.float32)])  # velocita' iniziale 0
+        proprio = np.concatenate([state[:3], np.zeros(3, dtype=np.float32)])  # zero initial velocity
         obs = {"visual": self._render(), "proprio": proprio}
         return obs, state
 
@@ -128,17 +105,11 @@ class PushCubeEnvWrapper(legacy_gym.Env):
         rewards = np.stack(rewards)
         dones = np.stack(dones)
         infos = aggregate_dct(infos)
-        infos["state"] = states  # sovrascrive con l'array gia' impilato, coerente con pusht/wall
+        infos["state"] = states  # overwrite with the already-stacked array, matching pusht/wall
         return obses, rewards, dones, infos
 
     def rollout(self, seed, init_state, actions):
-        """
-        seed: int
-        init_state: (state_dim,) - non usato direttamente, vedi note sopra
-        actions: (T, action_dim)
-        obses: dict con array (T+1, ...)
-        states: (T+1, state_dim)
-        """
+        """seed: int; init_state: unused, see prepare(); actions: (T, action_dim); returns obses (dict of (T+1, ...) arrays) and states (T+1, state_dim)."""
         obs, state = self.prepare(seed, init_state)
         obses, rewards, dones, infos = self.step_multiple(actions)
         for k in obses.keys():

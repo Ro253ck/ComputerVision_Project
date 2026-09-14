@@ -1,0 +1,3 @@
+# cluster-specific SLURM launcher scripts, kept locally but not shipped to GitHub
+plan_pushcube.sh
+plan_pushcube_goodgoal.sh
