@@ -129,9 +129,10 @@ class Trainer:
                 shuffle=False, # already shuffled in TrajSlicerDataset
                 num_workers=self.cfg.env.num_workers,
                 collate_fn=None,
+                # added: video decoding was the bottleneck; keep workers alive across epochs and prefetch batches so the GPU is not left waiting
                 pin_memory=True,
                 persistent_workers=True,
-                prefetch_factor=4,  # optional, helps hide data-loading latency
+                prefetch_factor=4,
             )
             for x in ["train", "valid"]
         }
@@ -161,8 +162,9 @@ class Trainer:
         self._keys_to_save += (
             ["encoder", "encoder_optimizer"] if self.train_encoder else []
         )
+        # action_encoder_optimizer added: upstream did not save it, so the Adam state of the action/proprio encoders was reset at every resume
         self._keys_to_save += (
-            ["predictor", "predictor_optimizer"]
+            ["predictor", "predictor_optimizer", "action_encoder_optimizer"]
             if self.train_predictor and self.cfg.has_predictor
             else []
         )
@@ -174,59 +176,15 @@ class Trainer:
         self.init_models()
         self.init_optimizers()
 
-        #Andiamo a rieseumare il modello qua, visto che è gia inizializzato
+        # moved here from init_models: checkpoints now hold state_dicts, so models and optimizers must exist before their state can be loaded into them
         model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
         if model_ckpt.exists():
             self.load_ckpt(model_ckpt)
             log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
-        
+
         self.epoch_log = OrderedDict()
 
-    # def save_ckpt(self):
-    #     self.accelerator.wait_for_everyone()
-    #     if self.accelerator.is_main_process:
-    #         if not os.path.exists("checkpoints"):
-    #             os.makedirs("checkpoints")
-    #         ckpt = {}
-    #         for k in self._keys_to_save:
-    #             if hasattr(self.__dict__[k], "module"):
-    #                 ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
-    #             else:
-    #                 ckpt[k] = self.__dict__[k]
-    #         torch.save(ckpt, "checkpoints/model_latest.pth")
-    #         torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
-    #         log.info("Saved model to {}".format(os.getcwd()))
-    #         ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
-    #     else:
-    #         ckpt_path = None
-    #     model_name = self.cfg["saved_folder"].split("outputs/")[-1]
-    #     model_epoch = self.epoch
-    #     return ckpt_path, model_name, model_epoch
-
-    # def save_ckpt(self):
-    #     self.accelerator.wait_for_everyone()
-    #     if self.accelerator.is_main_process:
-    #         if not os.path.exists("checkpoints"):
-    #             os.makedirs("checkpoints")
-    #         ckpt = {}
-    #         for k in self._keys_to_save:
-    #             obj = self.__dict__[k]
-    #             if hasattr(obj, "module"):
-    #                 ckpt[k] = self.accelerator.unwrap_model(obj)
-    #             elif hasattr(obj, "state_dict"):
-    #                 ckpt[k] = obj.state_dict()
-    #             else:
-    #                 ckpt[k] = obj
-    #         torch.save(ckpt, "checkpoints/model_latest.pth")
-    #         torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
-    #         log.info("Saved model to {}".format(os.getcwd()))
-    #         ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
-    #     else:
-    #         ckpt_path = None
-    #     model_name = self.cfg["saved_folder"].split("outputs/")[-1]
-    #     model_epoch = self.epoch
-    #     return ckpt_path, model_name, model_epoch
-
+    # changed: upstream pickled whole module objects; saving state_dicts keeps checkpoints loadable without the original classes and lets optimizers be restored
     def save_ckpt(self):
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
@@ -251,28 +209,7 @@ class Trainer:
         model_epoch = self.epoch
         return ckpt_path, model_name, model_epoch
 
-    # def load_ckpt(self, filename="model_latest.pth"):
-    #     ckpt = torch.load(filename)
-    #     for k, v in ckpt.items():
-    #         self.__dict__[k] = v
-    #     not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
-    #     if len(not_in_ckpt):
-    #         log.warning("Keys not found in ckpt: %s", not_in_ckpt)
-
-    # def load_ckpt(self, filename="model_latest.pth"):
-    #     ckpt = torch.load(filename)
-    #     for k, v in ckpt.items():
-    #         if k not in self.__dict__:
-    #             log.warning(f"Key {k} not in trainer, skipping")
-    #             continue
-    #         if hasattr(self.__dict__[k], "load_state_dict") and isinstance(v, dict):
-    #             self.__dict__[k].load_state_dict(v)
-    #         else:
-    #             self.__dict__[k] = v
-    #     not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
-    #     if len(not_in_ckpt):
-    #         log.warning("Keys not found in ckpt: %s", not_in_ckpt)
-
+    # changed to match save_ckpt: loads each state_dict into the existing object instead of replacing it, so optimizers keep pointing at the right parameters
     def load_ckpt(self, filename="model_latest.pth"):
         ckpt = torch.load(filename, map_location=self.device)
         for k, v in ckpt.items():
@@ -288,13 +225,8 @@ class Trainer:
         not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
         if len(not_in_ckpt):
             log.warning("Keys not found in ckpt: %s", not_in_ckpt)
-            
-    def init_models(self):
-        # model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
-        # if model_ckpt.exists():
-        #     self.load_ckpt(model_ckpt)
-        #     log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
 
+    def init_models(self):
         # initialize encoder
         if self.encoder is None:
             self.encoder = hydra.utils.instantiate(
@@ -456,12 +388,13 @@ class Trainer:
             self.monitor_thread.start()
 
         init_epoch = self.epoch + 1  # epoch starts from 1
-        for epoch in range(init_epoch, init_epoch + self.total_epochs):
+        # fixed: upstream looped to init_epoch + total_epochs, so a run resumed at epoch k trained until k + total_epochs
+        for epoch in range(init_epoch, self.total_epochs + 1):
             self.epoch = epoch
             self.accelerator.wait_for_everyone()
             self.train()
             self.accelerator.wait_for_everyone()
-            torch.cuda.empty_cache()  # <-- FIX: libera cache tra train e val
+            torch.cuda.empty_cache()  # added: release cached training memory so validation fits on the GPU with the ViT-B encoders
             self.val()
             self.logs_flash(step=self.epoch)
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
@@ -531,10 +464,6 @@ class Trainer:
         for i, data in enumerate(
             tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
-            # ACCORCIAMO L'EPOCA: interrompiamo dopo 500 batch per salvare il checkpoint
-            # if i >= 20:
-            #     break
-            
             obs, act, state = data
             plot = i == 0  # only plot from the first batch
             self.model.train()
@@ -650,7 +579,8 @@ class Trainer:
             obs, act, state = data
             plot = i == 0
             self.model.eval()
-            with torch.no_grad():  # <-- FIX: evita allocazione gradienti
+            # added: upstream ran validation with autograd on, storing activations that are never used
+            with torch.no_grad():
                 z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
                     obs, act
                 )
@@ -664,7 +594,7 @@ class Trainer:
 
             if self.cfg.has_decoder and plot:
                 # only eval images when plotting due to speed
-                with torch.no_grad():  # <-- FIX: anche qui
+                with torch.no_grad():
                     if self.cfg.has_predictor:
                         z_obs_out, z_act_out = self.model.separate_emb(z_out)
                         z_gt = self.model.encode_obs(obs)
@@ -723,96 +653,6 @@ class Trainer:
             loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
 
-    # def openloop_rollout(
-    #     self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
-    # ):
-    #     np.random.seed(self.cfg.training.seed)
-    #     min_horizon = min_horizon + self.cfg.num_hist
-    #     plotting_dir = f"rollout_plots/e{self.epoch}_rollout"
-    #     if self.accelerator.is_main_process:
-    #         os.makedirs(plotting_dir, exist_ok=True)
-    #     self.accelerator.wait_for_everyone()
-    #     logs = {}
-
-    #     # rollout with both num_hist and 1 frame as context
-    #     num_past = [(self.cfg.num_hist, ""), (1, "_1framestart")]
-
-    #     # sample traj
-    #     for idx in range(num_rollout):
-    #         valid_traj = False
-    #         while not valid_traj:
-    #             traj_idx = np.random.randint(0, len(dset))
-    #             obs, act, state, _ = dset[traj_idx]
-    #             act = act.to(self.device)
-    #             if rand_start_end:
-    #                 if obs["visual"].shape[0] > min_horizon * self.cfg.frameskip + 1:
-    #                     start = np.random.randint(
-    #                         0,
-    #                         obs["visual"].shape[0] - min_horizon * self.cfg.frameskip - 1,
-    #                     )
-    #                 else:
-    #                     start = 0
-    #                 max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
-    #                 if max_horizon > min_horizon:
-    #                     valid_traj = True
-    #                     horizon = np.random.randint(min_horizon, max_horizon + 1)
-    #             else:
-    #                 valid_traj = True
-    #                 start = 0
-    #                 horizon = (obs["visual"].shape[0] - 1) // self.cfg.frameskip
-
-    #         for k in obs.keys():
-    #             obs[k] = obs[k][
-    #                 start : 
-    #                 start + horizon * self.cfg.frameskip + 1 : 
-    #                 self.cfg.frameskip
-    #             ]
-    #         act = act[start : start + horizon * self.cfg.frameskip]
-    #         act = rearrange(act, "(h f) d -> h (f d)", f=self.cfg.frameskip)
-
-    #         obs_g = {}
-    #         for k in obs.keys():
-    #             obs_g[k] = obs[k][-1].unsqueeze(0).unsqueeze(0).to(self.device)
-    #         z_g = self.model.encode_obs(obs_g)
-    #         actions = act.unsqueeze(0)
-
-    #         for past in num_past:
-    #             n_past, postfix = past
-
-    #             obs_0 = {}
-    #             for k in obs.keys():
-    #                 obs_0[k] = (
-    #                     obs[k][:n_past].unsqueeze(0).to(self.device)
-    #                 )  # unsqueeze for batch, (b, t, c, h, w)
-
-    #             z_obses, z = self.model.rollout(obs_0, actions)
-    #             z_obs_last = slice_trajdict_with_t(z_obses, start_idx=-1, end_idx=None)
-    #             div_loss = self.err_eval_single(z_obs_last, z_g)
-
-    #             for k in div_loss.keys():
-    #                 log_key = f"z_{k}_err_rollout{postfix}"
-    #                 if log_key in logs:
-    #                     logs[f"z_{k}_err_rollout{postfix}"].append(
-    #                         div_loss[k]
-    #                     )
-    #                 else:
-    #                     logs[f"z_{k}_err_rollout{postfix}"] = [
-    #                         div_loss[k]
-    #                     ]
-
-    #             if self.cfg.has_decoder:
-    #                 visuals = self.model.decode_obs(z_obses)[0]["visual"]
-    #                 imgs = torch.cat([obs["visual"], visuals[0].cpu()], dim=0)
-    #                 self.plot_imgs(
-    #                     imgs,
-    #                     obs["visual"].shape[0],
-    #                     f"{plotting_dir}/e{self.epoch}_{mode}_{idx}{postfix}.png",
-    #                 )
-    #     logs = {
-    #         key: sum(values) / len(values) for key, values in logs.items() if values
-    #     }
-    #     return logs
-
     def openloop_rollout(
         self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
     ):
@@ -834,24 +674,22 @@ class Trainer:
                 traj_idx = np.random.randint(0, len(dset))
                 obs, act, state, _ = dset[traj_idx]
                 act = act.to(self.device)
-                vkey = "visual" if "visual" in obs else "visual_emb"  # <-- cache-aware
-                T = obs[vkey].shape[0]                                # <-- num. frame
                 if rand_start_end:
-                    if T > min_horizon * self.cfg.frameskip + 1:
+                    if obs["visual"].shape[0] > min_horizon * self.cfg.frameskip + 1:
                         start = np.random.randint(
                             0,
-                            T - min_horizon * self.cfg.frameskip - 1,
+                            obs["visual"].shape[0] - min_horizon * self.cfg.frameskip - 1,
                         )
                     else:
                         start = 0
-                    max_horizon = (T - start - 1) // self.cfg.frameskip
+                    max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
                     if max_horizon > min_horizon:
                         valid_traj = True
                         horizon = np.random.randint(min_horizon, max_horizon + 1)
                 else:
                     valid_traj = True
                     start = 0
-                    horizon = (T - 1) // self.cfg.frameskip
+                    horizon = (obs["visual"].shape[0] - 1) // self.cfg.frameskip
 
             for k in obs.keys():
                 obs[k] = obs[k][

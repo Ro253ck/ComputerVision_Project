@@ -10,7 +10,7 @@ import torch
 from tqdm import tqdm
 
 import gymnasium as gym
-import mani_skill.envs  # noqa: F401  registers PushCube-v1 with gym
+import mani_skill.envs  # noqa: F401  registers PushCube-v1 with gymnasium
 
 
 def load_base_demos(demo_path):
@@ -69,7 +69,7 @@ def _attempt_episode_train(env, base_actions, seed, max_steps, action_noise_std,
     action_dim = env.action_space.shape[-1]
     success_reached = False
     first_success_step = None
-    last_gripper_action = base_actions[min(len(base_actions), 1) - 1, -1] if len(base_actions) > 0 else 0.0  # held steady once frozen, so it doesn't shock the cube
+    last_gripper_action = base_actions[0, -1] if len(base_actions) > 0 else 0.0  # held once frozen: dropping it to 0 would jolt the gripper and disturb the cube
 
     for t in range(max_steps):
         if success_reached or t >= len(base_actions):

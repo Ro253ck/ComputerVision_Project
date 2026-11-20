@@ -15,7 +15,7 @@ def generate_mask_matrix(npatch, nwindow):
     ones = torch.ones(npatch, npatch)
     rows = []
     for i in range(nwindow):
-        row = torch.cat([ones] * (i+1) + [zeros] * (nwindow - i-1), dim=1)  # gives a (npatch, nwindow*npatch) row block
+        row = torch.cat([ones] * (i+1) + [zeros] * (nwindow - i-1), dim=1)  # (npatch, nwindow*npatch) block: patches of frame i attend to all patches of frames 0..i
         rows.append(row)
     mask = torch.cat(rows, dim=0).unsqueeze(0).unsqueeze(0)  # stack rows into (nwindow*npatch, nwindow*npatch), then add batch+heads dims to match the attention matrix (B, heads, T, T)
     return mask
@@ -66,7 +66,7 @@ class Attention(nn.Module):
 
         x = self.norm(x)
 
-        qkv = self.to_qkv(x).chunk(3, dim = -1)  # (B, 588, 1536) -> 3 tensors of (B, 588, 512), chunk returns a tuple
+        qkv = self.to_qkv(x).chunk(3, dim = -1)  # (B, T, 3 * inner_dim) -> tuple of 3 tensors (B, T, inner_dim); with our config T = 3 * 196 = 588, inner_dim = 16 * 64 = 1024
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)  # split each of Q/K/V into per-head chunks
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale

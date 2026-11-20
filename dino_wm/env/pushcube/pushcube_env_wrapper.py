@@ -2,20 +2,20 @@ import numpy as np
 import gymnasium
 import mani_skill.envs  # noqa: F401  registers PushCube-v1 with gymnasium
 
-# legacy gym (used by env/__init__.py's registration and plan.py's gym.make("pushcube", ...)) is a different package from gymnasium (ManiSkill's); PushTEnv/DotWall both inherit from gym.Env for the same reason, so we do too here
+# ManiSkill uses gymnasium, but DINO-WM registers and creates envs with legacy gym (env/__init__.py, plan.py), so the wrapper is a legacy gym.Env like PushT and Wall
 import gym as legacy_gym
 from gym import spaces
 
 from utils import aggregate_dct
 
 ENV_ACTION_DIM = 4  # xyz end-effector delta + gripper
-GOAL_RADIUS = 0.1  # PushCube-v1's real env.unwrapped.goal_radius, verified on the cluster
+GOAL_RADIUS = 0.1  # PushCube-v1 goal_radius
 
 
 class PushCubeEnvWrapper(legacy_gym.Env):
-    """Wraps PushCube-v1 (ManiSkill3) with the same interface as env/pusht and env/wall, so plan.py needs no changes to use it.
+    """PushCube-v1 (ManiSkill3) behind the same interface as env/pusht and env/wall, so plan.py can use it unchanged.
 
-    Unlike PushT/Wall, ManiSkill's scene can't be rebuilt from the compact 9-dim state (it lacks joint angles/orientation quaternions), so we reset with the episode's own seed (see PushCubeDataset.seeds) instead."""
+    State is 9-dim: tcp xyz, cube xyz, goal xyz. Unlike PushT/Wall the scene cannot be rebuilt from it (no joint angles or orientations), so episodes are reset from their simulator seed (see PushCubeDataset.seeds)."""
 
     def __init__(self, img_size=224, **kwargs):
         self._env = gymnasium.make(
@@ -37,12 +37,14 @@ class PushCubeEnvWrapper(legacy_gym.Env):
         self._prev_tcp = None
 
     def update_env(self, env_info):
-        """Receives {'seed': int} from PushCubeDataset.get_frames, already routed per-trajectory."""
+        """Receives the episode's {'seed': int} from PushCubeDataset, used by prepare() to reset to that scene."""
         if "seed" in env_info:
             self._episode_seed = int(env_info["seed"])
 
     def eval_state(self, goal_state, cur_state):
-        """Success = cube within GOAL_RADIUS of the goal, matching ManiSkill's own PushCube-v1 criterion."""
+        """Success = 3D distance between cube and goal centres below GOAL_RADIUS.
+
+        Slightly stricter than ManiSkill's own check, which uses the xy distance only: the cube centre sits ~2 cm above the goal disc, so this accepts up to ~9.8 cm in xy instead of 10 cm."""
         cube_pos = cur_state[3:6]
         goal_pos = cur_state[6:9]
         dist_to_goal = np.linalg.norm(cube_pos - goal_pos)
@@ -65,12 +67,12 @@ class PushCubeEnvWrapper(legacy_gym.Env):
         if hasattr(frame, "cpu"):
             frame = frame.cpu().numpy()
         frame = np.asarray(frame)
-        if frame.ndim == 4:  # (1, H, W, 3) -> (H, W, 3), ManiSkill3 is vectorized
+        if frame.ndim == 4:  # ManiSkill3 is vectorized: (1, H, W, 3) -> (H, W, 3)
             frame = frame[0]
         return frame
 
     def prepare(self, seed, init_state):
-        """Resets to the episode's exact scene; init_state is unused (see class docstring), we reset by seed instead."""
+        """Resets to the episode's scene from its seed; init_state is unused (see class docstring)."""
         reset_seed = self._episode_seed if self._episode_seed is not None else int(seed)
         self._env.reset(seed=reset_seed)
         state = self._read_state()

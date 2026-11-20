@@ -15,6 +15,7 @@ class CLIPEncoder(nn.Module):
         self.latent_ndim = 2
 
     def forward(self, x):
+        # unlike the other encoders, CLIP's last_hidden_state is not layer-normed (HF applies post_layernorm only to the pooled CLS token)
         out = self.base_model(pixel_values=x).last_hidden_state
         return out[:, 1:]  # drop the CLS token, keep patch tokens
 

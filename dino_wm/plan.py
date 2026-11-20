@@ -24,14 +24,6 @@ from utils import cfg_to_dict, seed
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
 
-ALL_MODEL_KEYS = [
-    "encoder",
-    "predictor",
-    "decoder",
-    "proprio_encoder",
-    "action_encoder",
-]
-
 def planning_main_in_dir(working_dir, cfg_dict):
     os.chdir(working_dir)
     return planning_main(cfg_dict=cfg_dict)
@@ -267,13 +259,7 @@ class PlanWorkspace:
         env_info = []
 
         # Check if any trajectory is long enough
-        #valid_traj = [
-        #    self.dset[i][0]["visual"].shape[0]
-        #    for i in range(len(self.dset))
-        #    if self.dset[i][0]["visual"].shape[0] >= traj_len
-        #]
-        #if len(valid_traj) == 0:
-        # Check if any trajectory is long enough
+        # changed: upstream decoded every video of the dataset just to read its length; seq_lengths gives the same number instantly
         seq_lengths = [self.dset.get_seq_length(i) for i in range(len(self.dset))]
         valid_traj = [l for l in seq_lengths if l >= traj_len]
         if len(valid_traj) == 0:
@@ -287,6 +273,7 @@ class PlanWorkspace:
                 obs, act, state, e_info = self.dset[traj_id]
                 max_offset = obs["visual"].shape[0] - traj_len
             state = state.numpy()
+            # changed for PushCube: the env can only be reset to an episode's seed, i.e. its first frame, so a random offset would replay the actions from the wrong state
             offset = 0 if self.env_name == "pushcube" else random.randint(0, max_offset)
             obs = {
                 key: arr[offset : offset + traj_len]
@@ -354,71 +341,8 @@ class PlanWorkspace:
         return logs
 
 
-# def load_ckpt(snapshot_path, device):
-#     with snapshot_path.open("rb") as f:
-#         payload = torch.load(f, map_location=device)
-#     loaded_keys = []
-#     result = {}
-#     for k, v in payload.items():
-#         if k in ALL_MODEL_KEYS:
-#             loaded_keys.append(k)
-#             result[k] = v.to(device)
-#     result["epoch"] = payload["epoch"]
-#     return result
-
-
-# def load_model(model_ckpt, train_cfg, num_action_repeat, device):
-#     result = {}
-#     if model_ckpt.exists():
-#         result = load_ckpt(model_ckpt, device)
-#         print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
-
-#     if "encoder" not in result:
-#         result["encoder"] = hydra.utils.instantiate(
-#             train_cfg.encoder,
-#         )
-#     if "predictor" not in result:
-#         raise ValueError("Predictor not found in model checkpoint")
-
-#     if train_cfg.has_decoder and "decoder" not in result:
-#         base_path = os.path.dirname(os.path.abspath(__file__))
-#         if train_cfg.env.decoder_path is not None:
-#             decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-#             ckpt = torch.load(decoder_path)
-#             if isinstance(ckpt, dict):
-#                 result["decoder"] = ckpt["decoder"]
-#             else:
-#                 result["decoder"] = torch.load(decoder_path)
-#         else:
-#             raise ValueError(
-#                 "Decoder path not found in model checkpoint \
-#                                 and is not provided in config"
-#             )
-#     elif not train_cfg.has_decoder:
-#         result["decoder"] = None
-
-#     model = hydra.utils.instantiate(
-#         train_cfg.model,
-#         encoder=result["encoder"],
-#         proprio_encoder=result["proprio_encoder"],
-#         action_encoder=result["action_encoder"],
-#         predictor=result["predictor"],
-#         decoder=result["decoder"],
-#         proprio_dim=train_cfg.proprio_emb_dim,
-#         action_dim=train_cfg.action_emb_dim,
-#         concat_dim=train_cfg.concat_dim,
-#         num_action_repeat=num_action_repeat,
-#         num_proprio_repeat=train_cfg.num_proprio_repeat,
-#     )
-#     model.to(device)
-#     return model
-
-def load_ckpt(snapshot_path, device):
-    with snapshot_path.open("rb") as f:
-        return torch.load(f, map_location=device)   # dict of state_dicts (+ 'epoch')
-
-
-def load_model(model_ckpt, train_cfg, num_action_repeat, device, dset):
+# rewritten: our checkpoints store state_dicts (see Trainer.save_ckpt) instead of pickled modules, so every module is rebuilt from the training config and then loaded
+def load_model(model_ckpt, train_cfg, num_action_repeat, device):
     payload = torch.load(model_ckpt, map_location=device)
     print(f"Loaded checkpoint from epoch {payload['epoch']}: {model_ckpt}")
 
@@ -427,7 +351,7 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device, dset):
     if "encoder" in payload:
         encoder.load_state_dict(payload["encoder"])
 
-    # proprio encoder: in_chans read from the checkpoint itself, not the dataset
+    # proprio encoder: in_chans read from the checkpoint itself, not the dataset, so a mismatch in proprio dims (e.g. with/without velocity) cannot build a wrong-sized layer
     proprio_in_chans = payload["proprio_encoder"]["patch_embed.weight"].shape[1]
     proprio_encoder = hydra.utils.instantiate(
         train_cfg.proprio_encoder,
@@ -540,40 +464,26 @@ def planning_main(cfg_dict):
     model_ckpt = (
         Path(model_path) / "checkpoints" / f"model_{cfg_dict['model_epoch']}.pth"
     )
-    #model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
-    model = load_model(model_ckpt, model_cfg, num_action_repeat, device, dset)
+    model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
 
     # use dummy vector env for wall and deformable envs
     if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
         from env.serial_vector_env import SerialVectorEnv
         env = SerialVectorEnv(
             [
+                # added disable_env_checker: DotWall never sets action_space, which makes gym's PassiveEnvChecker crash at creation
                 gym.make(
                     model_cfg.env.name,
                     *model_cfg.env.args,
-                    disable_env_checker=True,  # DotWall never sets action_space, which trips gym's PassiveEnvChecker
+                    disable_env_checker=True,
                     **model_cfg.env.kwargs,
                 )
                 for _ in range(cfg_dict["n_evals"])
             ]
         )
-
-    # use dummy vector env for wall and deformable envs
-    #if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
-    #    from env.serial_vector_env import SerialVectorEnv
-    #    env = SerialVectorEnv(
-    #        [
-    #            gym.make(
-    #                model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-    #            )
-    #            for _ in range(cfg_dict["n_evals"])
-    #        ]
-    #    )
     else:
-        # DINO_WM_FORCE_FORK=1 is a diagnostic-only escape hatch, normally unset; default (spawn for pushcube) is correct
-        force_fork_test = os.environ.get("DINO_WM_FORCE_FORK") == "1"
-        if model_cfg.env.name == "pushcube" and not force_fork_test:
-            # SubprocVectorEnv defaults to "fork" on Linux, but a forked child inherits the parent's already-initialized CUDA context, which silently hangs GPU-using libraries like ManiSkill/SAPIEN's renderer; "spawn" avoids this at the cost of ~700MB extra CUDA context per child, so we force it only for pushcube (PushT/Wall's simulators are CPU-only and stay on the cheaper default "fork")
+        if model_cfg.env.name == "pushcube":
+            # added for PushCube: a forked child inherits the parent's CUDA context, which hangs ManiSkill/SAPIEN's GPU renderer; spawn costs ~700MB of CUDA context per child, so PushT/Wall (CPU-only simulators) keep the default fork
             import multiprocessing
             multiprocessing.set_start_method("spawn", force=True)
         env = SubprocVectorEnv(

@@ -1,5 +1,7 @@
 from gym.envs.registration import register
-#from .pointmaze import U_MAZE
+
+# point_maze disabled: importing env.pointmaze requires mujoco and d4rl, which this project does not install or use
+# from .pointmaze import U_MAZE
 register(
     id="pusht",
     entry_point="env.pusht.pusht_wrapper:PushTWrapper",
@@ -33,6 +35,7 @@ register(
     reward_threshold=1.0,
 )
 
+# added: PushCube (ManiSkill3), episodes are 150 steps
 register(
     id="pushcube",
     entry_point="env.pushcube.pushcube_env_wrapper:PushCubeEnvWrapper",

@@ -29,3 +29,4 @@ datasets/pusht_dset_copia.py
 datasets/pusht_dset_copia2.py
 planning/evaluator.py.bak_20260901_102325
 results_raw.csv
+.vscode/

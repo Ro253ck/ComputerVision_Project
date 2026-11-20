@@ -143,9 +143,7 @@ class PlanEvaluator:  # evaluator for planning
                 filename=filename,
             )
         elif save_video:
-            # No decoder available: we cannot decode the world model's imagined
-            # rollout to pixels, but the executed (real) rollout comes straight
-            # from the simulator's own renderer and needs no decoder at all.
+            # added: without a decoder upstream saved no video at all; the executed rollout comes from the simulator renderer, so it can still be saved
             e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
             e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
             self._save_real_rollout_video(
@@ -196,12 +194,10 @@ class PlanEvaluator:  # evaluator for planning
 
         return logs, successes
 
+    # added: decoder-free counterpart of _plot_rollout_compare, used because our predictors are trained without a decoder
     def _save_real_rollout_video(self, e_visuals, successes, filename=""):
         """
-        Save the actually-executed rollout (real simulator frames) as one
-        video per episode, next to the goal frame. Does not need a trained
-        decoder, unlike _plot_rollout_compare (which additionally overlays
-        the world model's decoded "imagined" rollout).
+        One video per episode: executed (real) frames side by side with the goal frame.
         e_visuals: (b, t, c, h, w)
         """
         e_visuals = e_visuals[: self.n_plot_samples]
@@ -239,6 +235,7 @@ class PlanEvaluator:  # evaluator for planning
         i_visuals: (b, t, h, w, c)
         goal: (b, h, w, c)
         """
+        # changed: move to CPU once here, since decoded i_visuals are on the GPU while the goal frames they are concatenated with are on the CPU
         e_visuals = e_visuals[: self.n_plot_samples].cpu()
         i_visuals = i_visuals[: self.n_plot_samples].cpu()
         goal_visual = self.obs_g["visual"][: self.n_plot_samples]

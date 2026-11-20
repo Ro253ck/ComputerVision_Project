@@ -32,10 +32,7 @@ hydra:
 training:
   seed: 0
   epochs: 100
-  #batch_size: 32 # should >= nodes * tasks_per_node
-  #batch_size: 8
-  #batch_size: 64
-  batch_size: 16
+  batch_size: 32 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
   reconstruct_every_x_batch: 500
   num_reconstruct_samples: 6
@@ -61,7 +58,7 @@ num_proprio_repeat: 1
 num_hist: 3
 num_pred: 1 # only supports 1
 has_predictor: True # set this to False for only training a decoder
-has_decoder: False # set this to False for only training a predictor
+has_decoder: False # set this to False for only training a predictor; ours are predictor-only, the decoder used for figures was trained separately
 
 model:
   _target_: models.visual_world_model.VWorldModel

@@ -9,7 +9,8 @@ from typing import Callable, Optional
 from .traj_dset import TrajDataset, TrajSlicerDataset
 decord.bridge.set_bridge("torch")
 
-# precomputed stats over data/pushcube_noise/train (10000 rollouts), see scripts/compute_pushcube_stats.py
+# mean/std over all valid steps (up to seq_lengths) of the 10000 training rollouts; fixed constants, so 1k/5k/10k runs share the same normalization
+# the 4th action dim is the gripper, always closed (-1) in the expert demos: its mean/std only reflect the clipped action noise
 ACTION_MEAN = torch.tensor([0.0152, 0.0005, -0.0513, -0.9799])
 ACTION_STD = torch.tensor([0.0870, 0.0540, 0.0872, 0.0298])
 PROPRIO_MEAN = torch.tensor([0.0231, -0.0003, 0.0543, 0.0008, -0.0000, -0.0016])
@@ -30,12 +31,12 @@ class PushCubeDataset(TrajDataset):
         self.normalize_action = normalize_action
 
         self.states = torch.load(self.data_path / "states.pth").float()  # (N, T, 9) tcp+cube+goal
-        self.actions = torch.load(self.data_path / "abs_actions.pth").float()  # (N, T, 4) xyz+gripper
+        self.actions = torch.load(self.data_path / "abs_actions.pth").float()  # (N, T, 4) pd_ee_delta_pos commands: xyz end-effector delta + gripper; file named like PushT's
 
         with open(self.data_path / "seq_lengths.pkl", "rb") as f:
             self.seq_lengths = pickle.load(f)
 
-        # per-episode ManiSkill seed, needed only for planning (PushCubeEnvWrapper.rollout/prepare) to reset to the exact scene; optional, falls back to {} if the file is missing
+        # per-episode ManiSkill seed, needed only at planning time so PushCubeEnvWrapper can reset to the episode's scene; training works without it
         seeds_path = self.data_path / "seeds.pkl"
         if seeds_path.exists():
             with open(seeds_path, "rb") as f:
