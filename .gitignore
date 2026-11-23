@@ -4,3 +4,6 @@ plan_pushcube_goodgoal.sh
 plan_pushcube_test_fork.sh
 train_decoder.sh
 train_pushcube.sh
+
+# old versions of the report, kept locally only
+dino_wm/docs/old/
